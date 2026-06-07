@@ -183,8 +183,7 @@ with col1:
   <span class="status-live">✓ Live</span>
 </div>
 """, unsafe_allow_html=True)
-    if st.button("Open module →", key="go_coc", use_container_width=True):
-        st.switch_page("pages/1_Cost_of_Capital.py")
+    st.markdown("[Open module → Cost of Capital](./1_Cost_of_Capital)")
 
 with col2:
     st.markdown("""
@@ -200,8 +199,7 @@ with col2:
   <span class="status-live">✓ Live</span>
 </div>
 """, unsafe_allow_html=True)
-    if st.button("Open module →", key="go_cf", use_container_width=True):
-        st.switch_page("pages/2_Cash_Flows.py")
+    st.markdown("[Open module → Cash Flow Valuation](./2_Cash_Flows)")
 
 with col3:
     st.markdown("""
