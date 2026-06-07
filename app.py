@@ -183,6 +183,7 @@ with col1:
   <span class="status-live">✓ Live</span>
 </div>
 """, unsafe_allow_html=True)
+    st.page_link("pages/1_Cost_of_Capital.py", label="Open module →", icon="📐")
 
 with col2:
     st.markdown("""
@@ -198,6 +199,7 @@ with col2:
   <span class="status-live">✓ Live</span>
 </div>
 """, unsafe_allow_html=True)
+    st.page_link("pages/2_Cash_Flows.py", label="Open module →", icon="💵")
 
 with col3:
     st.markdown("""
@@ -213,6 +215,8 @@ with col3:
   <span class="status-building">⟳ Building</span>
 </div>
 """, unsafe_allow_html=True)
+    st.markdown("<div style='padding:6px 0;color:#475569;font-size:0.82rem'>Coming soon</div>",
+                unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 col4, col5, col6 = st.columns(3)
@@ -231,6 +235,8 @@ with col4:
   <span class="status-planned">· Planned</span>
 </div>
 """, unsafe_allow_html=True)
+    st.markdown("<div style='padding:6px 0;color:#475569;font-size:0.82rem'>Coming soon</div>",
+                unsafe_allow_html=True)
 
 with col5:
     st.markdown("""
@@ -246,6 +252,8 @@ with col5:
   <span class="status-planned">· Planned</span>
 </div>
 """, unsafe_allow_html=True)
+    st.markdown("<div style='padding:6px 0;color:#475569;font-size:0.82rem'>Coming soon</div>",
+                unsafe_allow_html=True)
 
 with col6:
     st.markdown("""
@@ -261,6 +269,8 @@ with col6:
   <span class="status-planned">· Planned</span>
 </div>
 """, unsafe_allow_html=True)
+    st.markdown("<div style='padding:6px 0;color:#475569;font-size:0.82rem'>Coming soon</div>",
+                unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core formulas strip
