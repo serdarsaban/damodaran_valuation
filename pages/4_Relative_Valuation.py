@@ -1,5 +1,6 @@
 """pages/4_Relative_Valuation.py — Relative Valuation (Ch 17–21)"""
 import streamlit as st
+from data_fetcher import get_company_data, source_badge_html
 import pandas as pd
 from relative_valuation import (
     justified_equity_multiples, justified_firm_multiples,
@@ -8,6 +9,8 @@ from relative_valuation import (
 )
 
 st.set_page_config(page_title="Relative Valuation", page_icon="⚖️", layout="wide")
+pg_id = "4"
+
 
 st.markdown("""
 <style>
@@ -109,7 +112,23 @@ def mult_card(label, value, ind_value=None, fmt=".1f"):
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## Settings")
-    st.markdown('<span class="placeholder-badge">⚠ Placeholder data</span>', unsafe_allow_html=True)
+
+    # ── Live data fetch ──────────────────────────────────────────────────
+    ticker_pg = st.text_input("Ticker (auto-fill inputs)", value="AAPL",
+                               key=f"ticker_{pg_id}").upper()
+    fred_key_pg = st.text_input("FRED API key (optional)", type="password",
+                                 key=f"fred_{pg_id}")
+    if st.button("🔄 Fetch live data", key=f"fetch_{pg_id}", type="primary"):
+        with st.spinner(f"Fetching {ticker_pg}…"):
+            _d = get_company_data(ticker_pg, fred_api_key=fred_key_pg, force_refresh=True)
+            st.session_state[f"live_{pg_id}"] = _d
+            st.rerun()
+    if f"live_{pg_id}" in st.session_state:
+        _ld = st.session_state[f"live_{pg_id}"]
+        st.markdown(source_badge_html(_ld), unsafe_allow_html=True)
+        st.caption(f"Auto-filled: {_ld.name}")
+    else:
+        st.markdown('<span class="placeholder-badge">⚠ Placeholder data</span>', unsafe_allow_html=True)
     industry = st.selectbox("Industry (for benchmarks)", ["(None)"] + INDUSTRY_NAMES_RV)
     industry = None if industry == "(None)" else industry
     current_price = st.number_input("Current stock price ($)", value=0.0, min_value=0.0)
