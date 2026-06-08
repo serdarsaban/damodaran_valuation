@@ -212,11 +212,11 @@ with col3:
     Stable-period consistency checks.
   </div>
   <div class="module-chapters">Chapter 11–12 · chgrowth.xls</div>
-  <span class="status-building">⟳ Building</span>
+  <span class="status-live">✓ Live</span>
 </div>
 """, unsafe_allow_html=True)
-    st.markdown("<div style='padding:6px 0;color:#475569;font-size:0.82rem'>Coming soon</div>",
-                unsafe_allow_html=True)
+    if st.button("Open module →", key="go_growth", use_container_width=True):
+        st.switch_page("pages/3_Growth.py")
 
 st.markdown("<br>", unsafe_allow_html=True)
 col4, col5, col6 = st.columns(3)
