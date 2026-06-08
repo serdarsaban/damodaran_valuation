@@ -232,11 +232,11 @@ with col4:
     Industry benchmark tables.
   </div>
   <div class="module-chapters">Chapters 17–21 · eqmult.xls · firmmult.xls</div>
-  <span class="status-planned">· Planned</span>
+  <span class="status-live">✓ Live</span>
 </div>
 """, unsafe_allow_html=True)
-    st.markdown("<div style='padding:6px 0;color:#475569;font-size:0.82rem'>Coming soon</div>",
-                unsafe_allow_html=True)
+    if st.button("Open module →", key="go_rv", use_container_width=True):
+        st.switch_page("pages/4_Relative_Valuation.py")
 
 with col5:
     st.markdown("""
