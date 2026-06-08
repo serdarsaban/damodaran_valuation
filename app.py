@@ -249,11 +249,11 @@ with col5:
     and firm-value-maximising optimal point.
   </div>
   <div class="module-chapters">Chapter 15 · capstru.xlsx · apv.xls</div>
-  <span class="status-planned">· Planned</span>
+  <span class="status-live">✓ Live</span>
 </div>
 """, unsafe_allow_html=True)
-    st.markdown("<div style='padding:6px 0;color:#475569;font-size:0.82rem'>Coming soon</div>",
-                unsafe_allow_html=True)
+    if st.button("Open module →", key="go_ocs", use_container_width=True):
+        st.switch_page("pages/5_Optimal_Capital_Structure.py")
 
 with col6:
     st.markdown("""
