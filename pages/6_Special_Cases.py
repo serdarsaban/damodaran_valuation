@@ -1,5 +1,6 @@
 """pages/6_Special_Cases.py — Special Cases (Ch 21, 22, 30, 32)"""
 import streamlit as st
+from data_fetcher import get_company_data, source_badge_html
 import pandas as pd
 import math
 from special_cases import (
@@ -11,6 +12,8 @@ from special_cases import (
 )
 
 st.set_page_config(page_title="Special Cases", page_icon="🔬", layout="wide")
+pg_id = "6"
+
 
 st.markdown("""
 <style>
@@ -129,7 +132,23 @@ def score_distress(p):
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## Settings")
-    st.markdown('<span class="placeholder-badge">⚠ Placeholder data</span>', unsafe_allow_html=True)
+
+    # ── Live data fetch ──────────────────────────────────────────────────
+    ticker_pg = st.text_input("Ticker (auto-fill inputs)", value="AAPL",
+                               key=f"ticker_{pg_id}").upper()
+    fred_key_pg = st.text_input("FRED API key (optional)", type="password",
+                                 key=f"fred_{pg_id}")
+    if st.button("🔄 Fetch live data", key=f"fetch_{pg_id}", type="primary"):
+        with st.spinner(f"Fetching {ticker_pg}…"):
+            _d = get_company_data(ticker_pg, fred_api_key=fred_key_pg, force_refresh=True)
+            st.session_state[f"live_{pg_id}"] = _d
+            st.rerun()
+    if f"live_{pg_id}" in st.session_state:
+        _ld = st.session_state[f"live_{pg_id}"]
+        st.markdown(source_badge_html(_ld), unsafe_allow_html=True)
+        st.caption(f"Auto-filled: {_ld.name}")
+    else:
+        st.markdown('<span class="placeholder-badge">⚠ Placeholder data</span>', unsafe_allow_html=True)
     st.markdown("""<div style='font-size:0.75rem;color:#475569;line-height:1.7;margin-top:8px'>
 <strong>Data roadmap</strong><br>
 🟡 Placeholder (now)<br>
