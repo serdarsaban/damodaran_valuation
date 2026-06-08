@@ -49,8 +49,8 @@ class ReportAssumptions:
     g_stable:        float = 0.03    # stable growth (perpetuity)
     stable_roc:      float = 0.12    # stable ROC (for terminal RIR)
     # Multiples context
-    payout_high:     float = 0.30
-    payout_stable:   float = 0.60
+    payout_high:     float = 0.0    # 0 = auto-detect from FCFE/NI ratio
+    payout_stable:   float = 0.0   # 0 = auto-detect
     net_margin:      float = 0.10
     # Capital structure
     run_ocs:         bool  = True
@@ -411,11 +411,15 @@ def _section_data_audit(d: CompanyData) -> str:
         ["Interest expense",     _usd(d.interest_expense,0),"yfinance financials"],
         ["Net income",           _usd(d.net_income,0),     "yfinance financials"],
         ["Revenue",              _usd(d.revenue,0),        "yfinance financials"],
+        ["EBITDA",               _usd(d.ebitda,0),         "yfinance derived"],
         ["Book debt",            _usd(d.book_debt,0),      "yfinance balance_sheet"],
         ["Book equity",          _usd(d.book_equity,0),    "yfinance balance_sheet"],
         ["Cash",                 _usd(d.cash,0),           "yfinance balance_sheet"],
         ["CapEx",                _usd(d.capex,0),          "yfinance cashflow"],
         ["Depreciation",         _usd(d.depreciation,0),  "yfinance cashflow"],
+        ["Net CapEx",            _usd(d.capex - d.depreciation,0), "derived: CapEx − Depr"],
+        ["ΔWorking Capital",     _usd(d.delta_wc,0),      "yfinance cashflow"],
+        ["FCFF (current)",       _usd(d.fcff,0),           "derived: NOPAT − Net CapEx − ΔWC"],
         ["Market cap",           _usd(d.equity_market_cap,0),"yfinance info"],
         ["Beta (levered)",       _num(d.beta_levered,3),   "yfinance info"],
         ["Stock price",          f"${d.price:.2f}" if d.price else "N/A", "yfinance info"],
@@ -522,9 +526,24 @@ def generate_report(
     fm   = None
     try:
         ke = coc.beta_result.ke if coc else 0.10
+        # For zero-dividend or low-payout firms, substitute FCFE/NI ratio
+        # FCFE ≈ NI - (1-debt_ratio)*reinvestment; for capital-light firms FCFE ≈ NI
+        # Use actual payout if dividends > 0, else estimate from FCFE/NI
+        payout_h = a.payout_high
+        payout_s = a.payout_stable
+        if d.net_income > 0:
+            # Estimate FCFE ratio: NI - (1-d_ratio)*(net_capex+dwc) / NI
+            net_capex_curr = d.capex - d.depreciation
+            d_ratio = d.book_debt / (d.book_equity + d.book_debt) if (d.book_equity + d.book_debt) > 0 else 0.2
+            equity_reinv = (1 - d_ratio) * (net_capex_curr + d.delta_wc)
+            fcfe_ratio = max(0.0, min(0.95, 1.0 - equity_reinv / d.net_income))
+            # If payout < 5% (zero-dividend), use FCFE ratio instead
+            if a.payout_high < 0.05:
+                payout_h = round(fcfe_ratio, 2)
+                payout_s = min(0.80, payout_h * 1.2)  # stable payout slightly higher
         eq_m = justified_equity_multiples(
-            g_high=a.g_high, payout_high=a.payout_high, ke_high=ke, n=a.n_high,
-            g_stable=a.g_stable, payout_stable=a.payout_stable, ke_stable=ke * 0.9,
+            g_high=a.g_high, payout_high=payout_h, ke_high=ke, n=a.n_high,
+            g_stable=a.g_stable, payout_stable=payout_s, ke_stable=ke * 0.9,
             net_margin=a.net_margin,
             book_equity_per_share=d.book_equity / d.shares if d.shares > 0 else 1,
             eps_next_year=d.eps * (1 + a.g_high) if d.eps else 1,
@@ -557,6 +576,7 @@ def generate_report(
                 beta_levered=d.beta_levered, rf=d.rf, erp=a.erp,
                 fcff=d.fcff, g_stable=a.g_stable,
                 firm_type=d.firm_type,
+                apply_bankruptcy_costs=True,   # always on in report
                 shares_outstanding=d.shares, current_price=d.price,
                 cash=d.cash, company=d.name,
             )
