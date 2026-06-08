@@ -1,5 +1,6 @@
 """pages/3_Growth.py — Growth & Terminal Value (Ch 11–12)"""
 import streamlit as st
+from data_fetcher import get_company_data, source_badge_html
 import pandas as pd
 import math
 from growth_models import (
@@ -8,6 +9,8 @@ from growth_models import (
 )
 
 st.set_page_config(page_title="Growth & Terminal Value", page_icon="📈", layout="wide")
+pg_id = "3"
+
 
 st.markdown("""
 <style>
@@ -148,7 +151,23 @@ def quartile_marker(value, q1, med, q3, fmt=".1%"):
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## Settings")
-    st.markdown('<span class="placeholder-badge">⚠ Placeholder data</span>', unsafe_allow_html=True)
+
+    # ── Live data fetch ──────────────────────────────────────────────────
+    ticker_pg = st.text_input("Ticker (auto-fill inputs)", value="AAPL",
+                               key=f"ticker_{pg_id}").upper()
+    fred_key_pg = st.text_input("FRED API key (optional)", type="password",
+                                 key=f"fred_{pg_id}")
+    if st.button("🔄 Fetch live data", key=f"fetch_{pg_id}", type="primary"):
+        with st.spinner(f"Fetching {ticker_pg}…"):
+            _d = get_company_data(ticker_pg, fred_api_key=fred_key_pg, force_refresh=True)
+            st.session_state[f"live_{pg_id}"] = _d
+            st.rerun()
+    if f"live_{pg_id}" in st.session_state:
+        _ld = st.session_state[f"live_{pg_id}"]
+        st.markdown(source_badge_html(_ld), unsafe_allow_html=True)
+        st.caption(f"Auto-filled: {_ld.name}")
+    else:
+        st.markdown('<span class="placeholder-badge">⚠ Placeholder data</span>', unsafe_allow_html=True)
     industry = st.selectbox("Industry", ["(None)"] + INDUSTRY_NAMES)
     industry = None if industry == "(None)" else industry
     rf = st.number_input("Risk-free rate", value=0.045, format="%.3f")
