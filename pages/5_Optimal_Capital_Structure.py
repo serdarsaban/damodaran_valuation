@@ -1,5 +1,6 @@
 """pages/5_Optimal_Capital_Structure.py — Optimal Capital Structure (Ch 15)"""
 import streamlit as st
+from data_fetcher import get_company_data, source_badge_html
 import pandas as pd
 from optimal_capital_structure import (
     optimal_capital_structure, OptimalCapitalStructureResult,
@@ -7,6 +8,8 @@ from optimal_capital_structure import (
 )
 
 st.set_page_config(page_title="Optimal Capital Structure", page_icon="🏗️", layout="wide")
+pg_id = "5"
+
 
 st.markdown("""
 <style>
@@ -102,7 +105,23 @@ def score_debt_position(current_dr, optimal_dr):
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## Settings")
-    st.markdown('<span class="placeholder-badge">⚠ Disney 2023 placeholder</span>', unsafe_allow_html=True)
+
+    # ── Live data fetch ──────────────────────────────────────────────────
+    ticker_pg = st.text_input("Ticker (auto-fill inputs)", value="AAPL",
+                               key=f"ticker_{pg_id}").upper()
+    fred_key_pg = st.text_input("FRED API key (optional)", type="password",
+                                 key=f"fred_{pg_id}")
+    if st.button("🔄 Fetch live data", key=f"fetch_{pg_id}", type="primary"):
+        with st.spinner(f"Fetching {ticker_pg}…"):
+            _d = get_company_data(ticker_pg, fred_api_key=fred_key_pg, force_refresh=True)
+            st.session_state[f"live_{pg_id}"] = _d
+            st.rerun()
+    if f"live_{pg_id}" in st.session_state:
+        _ld = st.session_state[f"live_{pg_id}"]
+        st.markdown(source_badge_html(_ld), unsafe_allow_html=True)
+        st.caption(f"Auto-filled: {_ld.name}")
+    else:
+        st.markdown('<span class="placeholder-badge">⚠ Disney 2023 placeholder</span>', unsafe_allow_html=True)
     firm_type = st.selectbox("Firm type", [1, 2, 3],
                               format_func=lambda x: _TABLE_NAMES[x])
     apply_bc = st.checkbox("Include indirect bankruptcy costs", value=False)
