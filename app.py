@@ -265,12 +265,12 @@ with col6:
     firms. Distressed firm survival probability. Real options.
     Private company illiquidity discount.
   </div>
-  <div class="module-chapters">Chapters 21–22, 28–30 · distress.xls · equity.xls</div>
-  <span class="status-planned">· Planned</span>
+  <div class="module-chapters">Chapters 21–22, 28–30, 32 · fcffeva.xls · fcffsimpleginzu.xlsx</div>
+  <span class="status-live">✓ Live</span>
 </div>
 """, unsafe_allow_html=True)
-    st.markdown("<div style='padding:6px 0;color:#475569;font-size:0.82rem'>Coming soon</div>",
-                unsafe_allow_html=True)
+    if st.button("Open module →", key="go_sc", use_container_width=True):
+        st.switch_page("pages/6_Special_Cases.py")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core formulas strip
