@@ -324,13 +324,86 @@ with c2:
 <div class="data-row"><div class="data-dot-pending"></div>
   <strong>Damodaran datasets</strong> — Industry betas, ERP, country spreads (Jan 2026)
 </div>
-<div class="data-row"><div class="data-dot-todo"></div>
-  <strong>All modules</strong> — Currently using placeholder data
+<div class="data-row"><div class="data-dot-pending"></div>
+  <strong>All modules</strong> — Live data via yfinance + EDGAR + FRED
 </div>
-<div class="data-row" style="border:none"><div class="data-dot-todo"></div>
-  Live connection wiring in progress — complete before Phase 3
+<div class="data-row" style="border:none"><div class="data-dot-pending"></div>
+  Downloadable HTML valuation report — all 6 modules in one file
 </div>
 """, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Report download
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.markdown('<div class="section-label">Download Report</div>', unsafe_allow_html=True)
+
+with st.container():
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        report_ticker = st.text_input("Ticker", value="AAPL", key="report_ticker",
+                                       placeholder="e.g. AAPL, MSFT, TSLA")
+    with col2:
+        fred_key_report = st.text_input("FRED API key (optional)", type="password",
+                                         key="report_fred")
+    with col3:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        generate_clicked = st.button("⬇ Generate & Download Report",
+                                      type="primary", use_container_width=True)
+
+    # Advanced assumptions expander
+    with st.expander("⚙ Assumptions (optional — uses sensible defaults)"):
+        ac1, ac2, ac3 = st.columns(3)
+        g_high_r    = ac1.number_input("High-growth rate",    value=0.10, format="%.3f", key="r_gh")
+        n_high_r    = ac1.number_input("High-growth years",   value=5,    step=1,         key="r_nh")
+        g_stable_r  = ac2.number_input("Stable growth rate",  value=0.03, format="%.3f", key="r_gs")
+        stable_roc_r= ac2.number_input("Stable ROC",          value=0.12, format="%.3f", key="r_roc")
+        payout_h_r  = ac3.number_input("Payout ratio (high)", value=0.30, format="%.2f", key="r_ph")
+        payout_s_r  = ac3.number_input("Payout ratio (stable)",value=0.60,format="%.2f", key="r_ps")
+        net_margin_r= ac3.number_input("Net margin",          value=0.10, format="%.3f", key="r_nm")
+
+    if generate_clicked:
+        if not report_ticker.strip():
+            st.error("Enter a ticker first.")
+        else:
+            ticker_clean = report_ticker.upper().strip()
+            with st.spinner(f"Fetching data and running all 6 modules for {ticker_clean}…"):
+                try:
+                    from data_fetcher import get_company_data
+                    from report_generator import generate_report, ReportAssumptions
+
+                    d = get_company_data(ticker_clean, fred_api_key=fred_key_report,
+                                          force_refresh=True)
+                    d.ebitda = d.ebitda or (d.ebit + d.depreciation)
+                    d.fcff   = (d.ebit * (1 - d.tax_rate)
+                                - (d.capex - d.depreciation) - d.delta_wc)
+
+                    assumptions = ReportAssumptions(
+                        g_high=g_high_r, n_high=int(n_high_r),
+                        g_stable=g_stable_r, stable_roc=stable_roc_r,
+                        payout_high=payout_h_r, payout_stable=payout_s_r,
+                        net_margin=net_margin_r,
+                    )
+
+                    html = generate_report(d, assumptions)
+                    from datetime import datetime
+                    filename = f"{ticker_clean}_valuation_{datetime.now().strftime('%Y%m%d')}.html"
+
+                    st.success(f"✓ Report ready — {len(html):,} bytes")
+                    st.download_button(
+                        label=f"⬇ Download {filename}",
+                        data=html,
+                        file_name=filename,
+                        mime="text/html",
+                        use_container_width=True,
+                    )
+                    if d.source == "placeholder":
+                        st.warning("⚠ Report uses placeholder data — enter a FRED API key and ensure yfinance can reach Yahoo Finance.", icon="⚠️")
+                    elif d.source == "partial":
+                        st.info(f"ℹ Some fields fell back to estimates: {', '.join(d.fetch_errors[:3])}")
+
+                except Exception as e:
+                    st.error(f"Report generation failed: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Footer
