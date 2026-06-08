@@ -4,6 +4,7 @@ Damodaran Ch 9–10, 14–15: FCFF and FCFE valuation models
 """
 
 import streamlit as st
+from data_fetcher import get_company_data, source_badge_html
 import pandas as pd
 import math
 from fcff_models import (
@@ -13,6 +14,8 @@ from fcff_models import (
 )
 
 st.set_page_config(page_title="Cash Flow Valuation", page_icon="💵", layout="wide")
+pg_id = "2"
+
 
 st.markdown("""
 <style>
@@ -267,7 +270,23 @@ def render_fcfe_result(r, price=0):
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## Model settings")
-    st.markdown('<span class="placeholder-badge">⚠ Placeholder data</span>', unsafe_allow_html=True)
+
+    # ── Live data fetch ──────────────────────────────────────────────────
+    ticker_pg = st.text_input("Ticker (auto-fill inputs)", value="AAPL",
+                               key=f"ticker_{pg_id}").upper()
+    fred_key_pg = st.text_input("FRED API key (optional)", type="password",
+                                 key=f"fred_{pg_id}")
+    if st.button("🔄 Fetch live data", key=f"fetch_{pg_id}", type="primary"):
+        with st.spinner(f"Fetching {ticker_pg}…"):
+            _d = get_company_data(ticker_pg, fred_api_key=fred_key_pg, force_refresh=True)
+            st.session_state[f"live_{pg_id}"] = _d
+            st.rerun()
+    if f"live_{pg_id}" in st.session_state:
+        _ld = st.session_state[f"live_{pg_id}"]
+        st.markdown(source_badge_html(_ld), unsafe_allow_html=True)
+        st.caption(f"Auto-filled: {_ld.name}")
+    else:
+        st.markdown('<span class="placeholder-badge">⚠ Placeholder data</span>', unsafe_allow_html=True)
     model_family = st.radio("Model type",
                              ["FCFF (firm → equity)", "FCFE (equity directly)"])
     is_fcff = "FCFF" in model_family
