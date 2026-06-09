@@ -41,16 +41,9 @@ def score_distress(p):
 
 with st.sidebar:
     st.markdown("## 🔬 Special Cases")
-    ticker = st.text_input("Ticker", value="AAPL", key=f"ticker_{pg_id}").upper()
-    fred_key = st.text_input("FRED API key (optional)", type="password", key=f"fred_{pg_id}")
-    if st.button("🔄 Fetch live data", key=f"fetch_{pg_id}", type="primary"):
-        with st.spinner(f"Fetching {ticker}…"):
-            _d = get_company_data(ticker, fred_api_key=fred_key, force_refresh=True)
-            st.session_state[f"live_{pg_id}"] = _d
-            st.rerun()
-    d = st.session_state.get(f"live_{pg_id}")
+    d = st.session_state.get("company_data")
     if d: st.markdown(source_badge_html(d), unsafe_allow_html=True); st.caption(d.name)
-    else: st.markdown('<span style="font-size:0.72rem;padding:2px 8px;border-radius:4px;background:#3b2a0f;color:#fbbf24">⚠ Enter ticker and fetch</span>', unsafe_allow_html=True)
+    else: st.warning("No data loaded. Go to the home page and click **Load company data**.")
 
 name = d.name if d else "—"
 st.title(f"🔬 Special Cases — {name}")

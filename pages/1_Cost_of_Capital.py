@@ -91,37 +91,20 @@ def metric_card(label, value, score, interp, colour, delta=""):
     st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div>{dh}{b}</div>', unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sidebar
+# Sidebar — reads from shared session_state set on home page
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## Company")
-    ticker = st.text_input("Ticker", value="AAPL").upper()
-    fred_key = st.text_input("FRED API key (optional)", type="password",
-                              help="Free at fred.stlouisfed.org — needed for live risk-free rate")
-
-    fetch_clicked = st.button("🔄 Fetch live data", type="primary")
+    st.markdown("## 📐 Cost of Capital")
+    d = st.session_state.get("company_data")
+    if d:
+        from data_fetcher import source_badge_html
+        st.markdown(source_badge_html(d), unsafe_allow_html=True)
+        st.caption(f"{d.name} ({d.ticker})")
+    else:
+        st.warning("No data loaded. Go to the home page and click **Load company data**.")
     st.markdown("---")
     st.markdown("### Override any input")
     override = st.checkbox("Manual override", value=False)
-    st.markdown("---")
-    st.markdown("""<div style='font-size:0.75rem;color:#475569;line-height:1.8'>
-<strong>Data sources</strong><br>
-📊 yfinance — beta, financials, market cap<br>
-📋 SEC EDGAR — debt schedule, leases<br>
-📈 FRED — 10-yr Treasury (rf)<br>
-📚 Damodaran — ERP, country spreads
-</div>""", unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Data fetch
-# ─────────────────────────────────────────────────────────────────────────────
-cache_key = f"company_{ticker}"
-if fetch_clicked or cache_key not in st.session_state:
-    with st.spinner(f"Fetching data for {ticker}…"):
-        d = get_company_data(ticker, fred_api_key=fred_key, force_refresh=fetch_clicked)
-        st.session_state[cache_key] = d
-else:
-    d = st.session_state[cache_key]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Optional manual override
