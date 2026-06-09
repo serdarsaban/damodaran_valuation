@@ -235,21 +235,10 @@ def optimal_capital_structure(
     # Adjusted EBITDA baseline (normalise for seasonality)
     ebitda_adjusted_base = ebitda
 
-    # Calibrate implied growth rate from current EV, FCFF, and actual WACC
-    # EV = FCFF*(1+g)/(WACC-g) → solve for g
-    # This keeps firm value consistent with market price at current structure
-    # Formula: g = (EV*WACC - FCFF) / (EV + FCFF)
-    # Use the actual current WACC (with lock_current_kd if provided)
-    current_de_ratio = debt_mv / equity_mv if equity_mv > 0 else 0
-    beta_l_current = beta_u * (1 + (1 - tax_rate) * current_de_ratio)
-    ke_current = rf + beta_l_current * erp
-    kd_current_at = (lock_current_kd or (rf + 0.009)) * (1 - tax_rate)
-    d_current = debt_mv / enterprise_value
-    e_current = 1 - d_current
-    wacc_current_actual = ke_current * e_current + kd_current_at * d_current
-    g_implied = (enterprise_value * wacc_current_actual - fcff) / (enterprise_value + fcff)
-    # Floor: g_implied must be positive and less than WACC
-    g_implied = max(0.01, min(g_implied, wacc_current_actual - 0.005))
+    # Use g_stable directly as perpetuity growth rate.
+    # Using g_implied from EV/FCFF breaks for high-growth firms where
+    # g_implied can exceed WACC at some debt ratios, giving infinite firm values.
+    g_implied = g_stable
 
     sweep: list[DebtRatioResult] = []
     best_wacc = math.inf
