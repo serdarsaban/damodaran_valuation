@@ -54,16 +54,17 @@ with st.sidebar:
 
 # ── Header ────────────────────────────────────────────────────────────────────
 name = d.name if d else "—"
+ticker = d.ticker if d else ""
 st.title(f"📈 Growth & Terminal Value — {name}")
 if not d:
-    st.info("Enter a ticker in the sidebar and click **🔄 Fetch live data**.")
+    st.info("Go to the home page, enter a ticker and click **Load company data**, then return here.")
     st.stop()
 
 st.markdown(source_badge_html(d), unsafe_allow_html=True)
 st.divider()
 
 # Get WACC
-coc_key = f"coc_{ticker}_{pg_id}"
+coc_key = f"coc_{d.ticker}_{pg_id}"
 if coc_key not in st.session_state:
     try:
         coc = full_cost_of_capital(ebit=d.ebit, interest_expense=d.interest_expense,
