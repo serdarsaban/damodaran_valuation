@@ -96,6 +96,7 @@ def metric_card(label, value, score, interp, colour, delta=""):
 with st.sidebar:
     st.markdown("## 📐 Cost of Capital")
     d = st.session_state.get("company_data")
+    ticker = d.ticker if d else ""
     if d:
         from data_fetcher import source_badge_html
         st.markdown(source_badge_html(d), unsafe_allow_html=True)
