@@ -74,11 +74,12 @@ with st.sidebar:
 
 # ── Header ────────────────────────────────────────────────────────────────────
 name = d.name if d else "—"
+ticker = d.ticker if d else ""
 st.title(f"💵 Cash Flow Valuation — {name}")
 st.markdown("**FCFF 2-stage model** · Damodaran Ch 10, 15 · fcff2st.xls · fcffginzu.xlsx")
 
 if not d:
-    st.info("Enter a ticker in the sidebar and click **🔄 Fetch live data** to run the model.")
+    st.info("Go to the home page, enter a ticker and click **Load company data**, then return here.")
     st.stop()
 
 st.markdown(source_badge_html(d), unsafe_allow_html=True)
@@ -87,7 +88,7 @@ if d.fetch_errors:
 st.divider()
 
 # ── Get WACC from CoC module if available, else compute inline ───────────────
-coc_key = f"coc_{ticker}_{pg_id}"
+coc_key = f"coc_{d.ticker}_{pg_id}"
 if coc_key not in st.session_state:
     try:
         coc = full_cost_of_capital(
