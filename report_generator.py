@@ -59,7 +59,103 @@ def _sc(score):
 
 def _badge(score, text):
     c = _sc(score)
-    return f'<span style="display:inline-block;padding:3px 10px;border-radius:20px;font-size:0.78rem;font-weight:500;background:{c}22;color:{c};border:1px solid {c}44">{score}/10 — {text}</span>'
+    short = text[:80] + "…" if len(text) > 80 else text
+    return f'<span style="display:inline-block;padding:3px 10px;border-radius:20px;font-size:0.78rem;font-weight:500;background:{c}22;color:{c};border:1px solid {c}44">{score}/10 — {short}</span>'
+
+def _scores_row(scores: list) -> str:
+    """scores: list of (score, text) tuples"""
+    badges = " &nbsp; ".join(_badge(s, t) for s, t in scores)
+    return f'<div style="margin:10px 0">{badges}</div>'
+
+def _scorecard(scores: dict) -> str:
+    """scores: {label: (score, text)} — renders a mini scorecard"""
+    rows = ""
+    composite = sum(s for s,_ in scores.values()) / len(scores) if scores else 0
+    for label, (score, text) in scores.items():
+        c = _sc(score)
+        bar = int(score * 10)
+        rows += (f'<div style="margin-bottom:12px">'
+                 f'<div style="display:flex;justify-content:space-between;margin-bottom:3px">'
+                 f'<span style="font-size:0.85rem;color:#cbd5e1">{label}</span>'
+                 f'<span style="font-size:0.85rem;color:{c};font-weight:500">{score}/10</span></div>'
+                 f'<div style="background:#1e293b;border-radius:4px;height:7px">'
+                 f'<div style="background:{c};width:{bar}%;height:7px;border-radius:4px"></div></div>'
+                 f'<div style="font-size:0.75rem;color:#64748b;margin-top:2px">{text[:70]}</div></div>')
+    return (f'<div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:20px 24px;margin:16px 0">'
+            f'<div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:2px;color:#475569;margin-bottom:4px">Composite Score</div>'
+            f'<div style="font-size:2.5rem;font-family:DM Serif Display,serif;color:#f1f5f9;margin-bottom:16px">{composite:.1f}<span style="font-size:1rem;color:#64748b"> / 10</span></div>'
+            f'{rows}</div>')
+
+# Scoring functions mirroring the pages
+def _score_wacc(w):
+    p=w*100
+    if p<5: return 9,"Very low — well below market norms"
+    elif p<7: return 8,"Low — below typical 7–9% range"
+    elif p<9: return 7,"Average — within 7–9% for most US firms"
+    elif p<11: return 5,"Above average — higher than market median"
+    elif p<14: return 3,"High — elevated financing costs"
+    else: return 1,"Very high — typical only for distressed firms"
+
+def _score_icr(icr):
+    if icr==math.inf or icr>12.5: return 10,"Exceptional — Aaa/AAA equivalent"
+    elif icr>8.5: return 9,"Excellent — Aa2/AA equivalent"
+    elif icr>5.5: return 8,"Strong — A-range rating"
+    elif icr>3.0: return 6,"Adequate — BBB to A− range"
+    elif icr>2.0: return 4,"Weak — BB range"
+    elif icr>1.25: return 2,"Stressed — B range"
+    else: return 1,"Distressed"
+
+def _score_beta(b):
+    if b<0.5: return 9,"Defensive"
+    elif b<0.8: return 8,"Low volatility"
+    elif b<1.1: return 7,"Market-rate risk"
+    elif b<1.4: return 5,"Moderately elevated"
+    elif b<1.8: return 3,"High beta"
+    else: return 1,"Very high beta"
+
+def _score_ke(ke):
+    p=ke*100
+    if p<7: return 9,"Very low cost of equity"
+    elif p<9: return 8,"Below average"
+    elif p<11: return 7,"Average — 9–11% range"
+    elif p<13: return 5,"Above average"
+    elif p<16: return 3,"High"
+    else: return 1,"Very high"
+
+def _score_tv(tv_pct):
+    if tv_pct<.50: return 9,"Low TV dependence — most value from near-term cash flows"
+    elif tv_pct<.65: return 7,"Moderate — typical for stable businesses"
+    elif tv_pct<.80: return 5,"High — sensitive to stable-growth assumptions"
+    else: return 3,"Very high (>80%) — treat assumptions with care"
+
+def _score_mos(price, value):
+    if price<=0 or value<=0: return 5,"No price provided"
+    r=value/price
+    if r>1.5: return 10,f"Large margin of safety — value is {r:.1f}× price"
+    elif r>1.2: return 8,f"Good — {r:.1f}× price"
+    elif r>0.9: return 6,f"Fairly valued — {r:.1f}× price"
+    elif r>0.7: return 4,f"Mild overvaluation"
+    else: return 2,f"Significant overvaluation"
+
+def _score_roc(roc, wacc):
+    ex=roc-wacc
+    if ex>.15: return 9,f"ROC {ex:.1%} above WACC — exceptional value creation"
+    elif ex>.05: return 8,f"Healthy {ex:.1%} excess return"
+    elif ex>0: return 6,f"Marginal {ex:.1%} excess return"
+    elif ex>-.03: return 4,"ROC ≈ WACC — value neutral"
+    else: return 2,f"ROC {abs(ex):.1%} below WACC — destroying value"
+
+def _score_distress(p):
+    if p<.01: return 9,f"Negligible risk ({p:.2%})"
+    elif p<.05: return 7,f"Low risk ({p:.2%})"
+    elif p<.15: return 5,f"Moderate risk ({p:.2%})"
+    elif p<.35: return 3,f"High risk ({p:.2%})"
+    else: return 1,f"Very high risk ({p:.2%})"
+
+def _score_mult(multiple_type, value, industry=None):
+    from relative_valuation import score_multiple
+    s, t, _ = score_multiple(multiple_type, value, industry)
+    return s, t
 
 def _section(title, subtitle=""):
     sub = f'<p style="color:#64748b;font-size:0.9rem;margin:4px 0 0">{subtitle}</p>' if subtitle else ""
@@ -117,6 +213,14 @@ def _render_coc(d, coc):
     html += _subsection("Step 3 — Market Value of Debt & WACC")
     html += _formula(f"MV(Debt) = {d.interest_expense:,.0f}×annuity({dc.kd_pretax:.2%},5) + {d.book_debt:,.0f}/(1+{dc.kd_pretax:.2%})⁵ = {coc.market_debt:,.0f}<br>WACC = {br.ke:.2%}×{wr.weight_equity:.0%} + {dc.kd_aftertax:.2%}×{wr.weight_debt:.0%} = {wr.wacc:.2%}", source="Damodaran Ch 8 p.194–195; wacccalc.xls")
     html += _metrics(("Book Debt", _usd(d.book_debt)), ("Market Debt", _usd(coc.market_debt)), ("Equity Weight", _pct(wr.weight_equity,0)), ("Debt Weight", _pct(wr.weight_debt,0)), ("WACC", _pct(wr.wacc)))
+    # Scorecard
+    scores = {
+        "WACC":              _score_wacc(wr.wacc),
+        "Cost of Equity":    _score_ke(br.ke),
+        "Interest Coverage": _score_icr(dc.icr),
+        "Beta":              _score_beta(br.beta_relevered),
+    }
+    html += _scorecard(scores)
     return html
 
 
@@ -151,7 +255,7 @@ def _render_growth(d, g, tv):
     return html
 
 
-def _render_fcff(d, r):
+def _render_fcff(d, r, price=0):
     tv_pct = r.pv_terminal_value / r.value_of_firm if r.value_of_firm > 0 else 0
     html  = _section("Module 02 — Cash Flow Valuation (FCFF 2-stage)", "Ch 10, 15 · fcff2st.xls · fcffginzu.xlsx")
     html += _formula("FCFF = EBIT×(1−t) − Net_CapEx − ΔWC<br>Value_Firm = Σ PV(FCFF) + PV(TV)<br>Value_Equity = Value_Firm − Debt + Cash", source="Damodaran Ch 10 p.247; Ch 15 p.375")
@@ -178,6 +282,14 @@ def _render_fcff(d, r):
     )
     if tv_pct > 0.75: html += _warn(f"Terminal value is {tv_pct:.0%} of firm value — highly sensitive to WACC and g assumptions.")
     else: html += _ok(f"Terminal value dependency {tv_pct:.0%} — within acceptable range.")
+    # Scores
+    s_tv,t_tv = _score_tv(tv_pct)
+    # Margin of safety vs market price
+    badge_list = [(s_tv, t_tv)]
+    if price > 0:
+        s_m,t_m = _score_mos(price, r.value_per_share)
+        badge_list.append((s_m, t_m))
+    html += _scores_row(badge_list)
     return html
 
 
@@ -209,6 +321,10 @@ def _render_multiples(d, eq_m, fm):
         ]
         html += _table(["Multiple","Justified","Implied EV"], rows)
         html += _box(f"ROIC (high growth): {fm.roic_high:.2%} | ROIC (stable): {fm.roic_stable:.2%}<br>EV/IC = {fm.ev_ic:.2f}× — {'value creation: ROIC > WACC' if fm.roic_high > fm.wacc_high else 'value destruction: ROIC < WACC'}")
+    # Scores for firm multiples
+    if fm:
+        s_ev,t_ev = _score_mult("ev_sales", fm.ev_sales_forward)
+        html += _scores_row([(s_ev, f"EV/Sales {fm.ev_sales_forward:.1f}× — {t_ev}")])
     return html
 
 
@@ -235,51 +351,142 @@ def _render_ocs(d, ocs):
 
 
 def _render_special(d, coc):
+    from special_cases import financial_firm_excess_returns, normalise_earnings
+
     wacc_val = coc.wacc_result.wacc if coc else 0.09
-    ic = d.book_equity + d.book_debt
-    nopat = d.ebit * (1 - d.tax_rate)
-    roc = nopat / ic if ic > 0 else 0
+    ke_val   = coc.beta_result.ke   if coc else 0.10
+    ic       = d.book_equity + d.book_debt
+    nopat    = d.ebit * (1 - d.tax_rate)
+    roc      = nopat / ic if ic > 0 else 0
     eva_curr = nopat - wacc_val * ic
 
     html  = _section("Module 06 — Special Cases", "Ch 21, 22, 30, 32 · fcffeva.xls · fcffsimpleginzu.xlsx")
 
-    # EVA
-    html += _subsection("EVA — Current Year")
-    html += _formula(f"EVA = NOPAT − WACC × IC = {nopat:,.0f} − {wacc_val:.2%} × {ic:,.0f} = {eva_curr:,.0f}", source="Damodaran Ch 32 p.799; fcffeva.xls")
-    html += _metrics(("NOPAT", _usd(nopat,0)), ("WACC Charge", _usd(wacc_val*ic,0)), ("EVA", _usd(eva_curr,0)), ("ROC", _pct(roc)), ("ROC − WACC", f"{(roc-wacc_val)*100:+.2f}pp"))
-    html += (_ok(f"Positive EVA: {d.name} earns {roc:.2%} on capital vs {wacc_val:.2%} WACC — creating {(roc-wacc_val)*100:.2f}pp of value per year.")
+    # ── EVA ──────────────────────────────────────────────────────────────────
+    html += _subsection("1. EVA (Economic Value Added)")
+    html += _formula(
+        f"EVA = NOPAT − WACC × Invested_Capital<br>"
+        f"    = {nopat:,.0f} − {wacc_val:.2%} × {ic:,.0f}<br>"
+        f"    = <strong>{eva_curr:,.0f}</strong>  ({'positive — value creation' if eva_curr>0 else 'negative — value destruction'})",
+        note=f"= (ROC − WACC) × IC = ({roc:.2%} − {wacc_val:.2%}) × {ic:,.0f}",
+        source="Damodaran Ch 32 p.799; fcffeva.xls"
+    )
+    html += _metrics(
+        ("NOPAT", _usd(nopat,0)),
+        ("WACC Charge", _usd(wacc_val*ic,0)),
+        ("EVA", _usd(eva_curr,0)),
+        ("ROC", _pct(roc)),
+        ("Excess Return", f"{(roc-wacc_val)*100:+.2f}pp"),
+    )
+    s_roc,t_roc = _score_roc(roc, wacc_val)
+    html += _scores_row([(s_roc, t_roc)])
+    html += (_ok(f"Positive EVA of {_usd(eva_curr,0)} — earns {roc:.2%} on capital vs {wacc_val:.2%} cost. Every dollar invested creates value.")
              if eva_curr > 0 else
-             _warn(f"Negative EVA: ROC of {roc:.2%} is below WACC of {wacc_val:.2%}. Growth is currently destroying value."))
+             _warn(f"Negative EVA of {_usd(eva_curr,0)} — ROC {roc:.2%} is below WACC {wacc_val:.2%}. Growth at current returns destroys value."))
 
-    # Distress
-    html += _subsection("Distress Probability (from Credit Rating)")
+    # Forward EVA projection (5 years at recommended growth)
+    html += _subsection("EVA — 5-Year Projection")
+    html += _box("EVA₁ through EVA₅ assuming NOPAT grows at 10% with capital growing proportionally.")
+    eva_rows = []
+    nopat_t = nopat; ic_t = ic
+    for t in range(1,6):
+        nopat_t *= 1.10
+        ic_t    *= 1.10
+        eva_t    = nopat_t - wacc_val * ic_t
+        eva_rows.append([f"Year {t}", _usd(nopat_t,0), _usd(wacc_val*ic_t,0), _usd(eva_t,0), _pct(nopat_t/ic_t)])
+    html += _table(["Year","NOPAT","WACC Charge","EVA","ROC"], eva_rows)
+
+    # ── Distress ──────────────────────────────────────────────────────────────
+    html += _subsection("2. Distressed Firm Analysis")
     rating = coc.debt_cost.rating if coc else "Baa2/BBB"
-    rating_simple = "AAA" if "AAA" in rating else "AA" if "AA" in rating else "A" if "/A" in rating and "BBB" not in rating else "BBB" if "BBB" in rating else "BB" if "BB" in rating else "B" if "/B" in rating else "CCC/C"
-    p5 = default_probability_from_rating(rating_simple, 5)
-    gc_val = d.equity_market_cap + d.book_debt
-    distress_val = d.book_debt * 0.6
-    dist = distressed_firm_value(gc_val, d.book_debt, p5, distress_val, d.shares, d.cash)
-    html += _table(["Item","Value"],[
-        ["Synthetic rating", f"{rating} (→ {rating_simple} for Moody's lookup)"],
-        ["5-year default probability", _pct(p5)],
-        ["Going-concern equity value/share", f"${dist.value_per_share_gc:.2f}"],
-        ["Distress-adjusted equity value/share", f"${dist.value_per_share_adjusted:.2f}"],
-        ["Value haircut from distress risk", f"{(1-dist.value_per_share_adjusted/dist.value_per_share_gc)*100:.1f}%" if dist.value_per_share_gc > 0 else "N/A"],
-    ])
-
-    # Earnings normalisation
-    if d.historical_eps:
-        html += _subsection("Earnings Normalisation")
-        margins = [e / r for e, r in zip(d.historical_eps, d.historical_revenue) if r > 0] if d.historical_revenue and len(d.historical_revenue) == len(d.historical_eps) else []
-        avg_margin = sum(margins)/len(margins) if margins else d.net_income/d.revenue if d.revenue > 0 else 0
-        norm_earnings = avg_margin * d.revenue
-        curr_margin = d.net_income / d.revenue if d.revenue > 0 else 0
-        html += _table(["Method","Normalised Earnings","vs Current"],[
-            ["Current (reported)", _usd(d.net_income,0), "—"],
-            ["Avg historical margin × revenue", _usd(norm_earnings,0), f"{(norm_earnings/d.net_income-1)*100:+.1f}%" if d.net_income else "—"],
+    rating_simple = ("AAA" if "AAA" in rating else "AA" if "AA" in rating else
+                     "A" if "/A" in rating and "BBB" not in rating else
+                     "BBB" if "BBB" in rating else "BB" if "BB" in rating else
+                     "B" if "/B" in rating else "CCC/C")
+    html += _formula(
+        f"Adjusted_Value = GC_Value × (1 − p_default) + Distress_Sale × p_default",
+        source="Damodaran Ch 22 p.556; Ch 30 p.727; Moody's default data"
+    )
+    gc_val      = d.equity_market_cap + d.book_debt
+    distress_val= d.book_debt * 0.6
+    rows_dist = []
+    for years in [1,3,5]:
+        p = default_probability_from_rating(rating_simple, years)
+        dist = distressed_firm_value(gc_val, d.book_debt, p, distress_val, d.shares, d.cash)
+        rows_dist.append([
+            f"{years}yr", _pct(p),
+            f"${dist.value_per_share_gc:.2f}",
+            f"${dist.value_per_share_adjusted:.2f}",
+            f"{(1-dist.value_per_share_adjusted/dist.value_per_share_gc)*100:.1f}%" if dist.value_per_share_gc>0 else "N/A",
         ])
-        if abs(norm_earnings - d.net_income) / d.net_income > 0.15 if d.net_income else False:
-            html += _warn(f"Current net income ({_pct(curr_margin)} margin) differs from normalised ({_pct(avg_margin)} avg margin) by more than 15%. Consider using normalised earnings.")
+    html += _table(["Horizon","Default Prob","GC Value/Share","Adjusted Value/Share","Haircut"], rows_dist)
+    p5 = default_probability_from_rating(rating_simple, 5)
+    s_dist,t_dist = _score_distress(p5)
+    html += _scores_row([(s_dist, f"5-year default probability {p5:.2%} — {t_dist}")])
+    html += _box(f"Synthetic rating: <strong>{rating}</strong> (→ {rating_simple} for Moody's lookup)<br>"
+                 f"Distress sale value assumed at 60% of book debt = {_usd(distress_val,0)}")
+
+    # ── Financial firm ────────────────────────────────────────────────────────
+    html += _subsection("3. Financial Firm — Excess Returns Model")
+    html += _formula(
+        "Value = Book_Equity + PV[(ROE − ke) × Book_Equity]",
+        note="For banks/insurers where debt is raw material, not capital",
+        source="Damodaran Ch 21 p.519"
+    )
+    roe_curr = d.net_income / d.book_equity if d.book_equity > 0 else 0
+    try:
+        ff = financial_firm_excess_returns(
+            book_equity=d.book_equity,
+            roe_high=roe_curr, ke_high=ke_val, g_high=0.08, n_high=5,
+            roe_stable=max(ke_val*1.05, 0.08), ke_stable=ke_val*0.9, g_stable=0.03,
+            shares=d.shares,
+        )
+        pbv = ff.value_of_equity / ff.book_equity if ff.book_equity > 0 else 0
+        html += _metrics(
+            ("Book Equity", _usd(ff.book_equity,0)),
+            ("ROE (current)", _pct(roe_curr)),
+            ("ke", _pct(ke_val)),
+            ("Excess Return", f"{(roe_curr-ke_val)*100:+.2f}pp"),
+            ("PV Excess Returns", _usd(ff.pv_excess_returns,0)),
+            ("Equity Value", _usd(ff.value_of_equity,0)),
+            ("PBV", f"{pbv:.2f}×"),
+        )
+        s_er,t_er = _score_roc(roe_curr, ke_val)
+        html += _scores_row([(s_er, t_er)])
+        html += _box(
+            f"If valued as a financial firm: equity value = {_usd(ff.value_of_equity,0)} ({pbv:.2f}× book).<br>"
+            f"{"ROE {:.2%} > ke {:.2%} — justified premium to book.".format(roe_curr, ke_val) if roe_curr > ke_val else "ROE {:.2%} < ke {:.2%} — should trade below book.".format(roe_curr, ke_val)}"
+        )
+    except Exception as e:
+        html += _warn(f"Financial firm model: {e}")
+
+    # ── Earnings normalisation ────────────────────────────────────────────────
+    html += _subsection("4. Earnings Normalisation")
+    html += _formula(
+        "Method 1: Average of last N years<br>"
+        "Method 2: Avg historical margin × current revenue  (preferred)<br>"
+        "Method 3: Industry/historical ROA × current assets",
+        source="Damodaran Ch 22 p.541"
+    )
+    if d.historical_eps and d.historical_revenue and len(d.historical_eps) == len(d.historical_revenue):
+        margins = [e/r for e,r in zip(d.historical_eps, d.historical_revenue) if r>0]
+        avg_margin = sum(margins)/len(margins) if margins else 0
+        norm = avg_margin * d.revenue
+        avg_eps = sum(d.historical_eps)/len(d.historical_eps) if d.historical_eps else d.net_income
+        curr_margin = d.net_income/d.revenue if d.revenue>0 else 0
+        html += _table(["Method","Earnings","Margin","vs Current"],[
+            ["Current (reported)", _usd(d.net_income,0), _pct(curr_margin), "—"],
+            ["Avg historical earnings", _usd(avg_eps*d.shares,0) if d.shares else "N/A", "—",
+             f"{(avg_eps*d.shares/d.net_income-1)*100:+.1f}%" if d.net_income and d.shares else "—"],
+            ["Avg margin × current rev", _usd(norm,0), _pct(avg_margin),
+             f"{(norm/d.net_income-1)*100:+.1f}%" if d.net_income else "—"],
+        ])
+        if d.net_income and abs(norm-d.net_income)/d.net_income > 0.15:
+            html += _warn(f"Current margin {_pct(curr_margin)} differs from historical avg {_pct(avg_margin)} by more than 15% — consider using normalised earnings for valuation.")
+        else:
+            html += _ok(f"Current earnings broadly in line with historical average ({_pct(curr_margin)} vs {_pct(avg_margin)} avg margin).")
+    else:
+        html += _box("Insufficient historical data for earnings normalisation.")
     return html
 
 
@@ -467,7 +674,7 @@ def generate_report(d: CompanyData, a: Optional[ReportAssumptions] = None) -> st
     if errors: body += "".join(_warn(f"Module error: {e}") for e in errors)
     if coc:        body += _render_coc(d, coc)
     if g_result:   body += _render_growth(d, g_result, tv_result)
-    if fcff_result:body += _render_fcff(d, fcff_result)
+    if fcff_result:body += _render_fcff(d, fcff_result, d.price)
     if eq_m or fm: body += _render_multiples(d, eq_m, fm)
     if ocs:        body += _render_ocs(d, ocs)
     if coc:        body += _render_special(d, coc)
