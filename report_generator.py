@@ -204,15 +204,15 @@ def _render_coc(d, coc):
     html += _subsection(f"Step 1 — Synthetic Credit Rating [{_TABLE_NAMES.get(dc.firm_type,'Large firm')}]")
     html += _formula(f"ICR = EBIT / Interest = {d.ebit:,.0f} / {d.interest_expense:,.0f} = {dc.icr:.2f}×  →  {dc.rating}  →  spread {dc.company_spread:.2%}", source="Damodaran Ch 8 p.183; ratings.xls")
     html += _metrics(("ICR", f"{dc.icr:.2f}×" if dc.icr<999 else "∞"), ("Rating", dc.rating), ("Company Spread", _pct(dc.company_spread)), ("Pre-tax kd", _pct(dc.kd_pretax)), ("After-tax kd", _pct(dc.kd_aftertax)))
-    html += _box(f"kd = rf + spread = {dc.rf:.2%} + {dc.company_spread:.2%}{(' + ' + _pct(dc.country_spread) + ' country') if dc.country_spread else ''} = <strong>{dc.kd_pretax:.2%}</strong>  →  after-tax = {dc.kd_pretax:.2%} × (1−{dc.tax_rate:.0%}) = <strong>{dc.kd_aftertax:.2%}</strong>")
+    html += _box(f"kd = rf + spread = {dc.rf:.2%} + {dc.company_spread:.2%}{(' + ' + _pct(dc.country_spread) + ' country') if dc.country_spread else ''} = <strong>{dc.kd_pretax:.2%}</strong>  →  after-tax = {dc.kd_pretax:.2%} × (1−{dc.tax_rate:.2%}) = <strong>{dc.kd_aftertax:.2%}</strong>")
 
     html += _subsection("Step 2 — Beta & Cost of Equity")
-    html += _formula(f"β_u = {br.beta_levered_input:.3f} / [1 + (1−{br.tax_rate:.0%})×{br.current_de:.4f}] = {br.beta_unlevered:.3f}<br>ke = {br.rf:.2%} + {br.beta_relevered:.3f} × {br.erp:.2%} = {br.ke:.2%}", source="Damodaran Ch 8 p.170; levbeta.xls")
-    html += _metrics(("Unlevered β", f"{br.beta_unlevered:.3f}"), ("Re-levered β", f"{br.beta_relevered:.3f}"), ("rf", _pct(br.rf)), ("ERP", _pct(br.erp)), ("Cost of Equity", _pct(br.ke)))
+    html += _formula(f"β_u = {br.beta_levered_input:.3f} / [1 + (1−{br.tax_rate:.2%})×{br.current_de:.4f}] = {br.beta_unlevered:.3f}<br>ke = {br.rf:.2%} + {br.beta_relevered:.3f} × {br.erp:.2%} = {br.ke:.2%}", source="Damodaran Ch 8 p.170; levbeta.xls")
+    html += _metrics(("Unlevered β", f"{br.beta_unlevered:.3f}"), ("Re-levered β", f"{br.beta_relevered:.3f}"), ("Risk-free Rate", _pct(br.rf)), ("ERP", _pct(br.erp)), ("Cost of Equity", _pct(br.ke)))
 
     html += _subsection("Step 3 — Market Value of Debt & WACC")
     html += _formula(f"MV(Debt) = {d.interest_expense:,.0f}×annuity({dc.kd_pretax:.2%},5) + {d.book_debt:,.0f}/(1+{dc.kd_pretax:.2%})⁵ = {coc.market_debt:,.0f}<br>WACC = {br.ke:.2%}×{wr.weight_equity:.0%} + {dc.kd_aftertax:.2%}×{wr.weight_debt:.0%} = {wr.wacc:.2%}", source="Damodaran Ch 8 p.194–195; wacccalc.xls")
-    html += _metrics(("Book Debt", _usd(d.book_debt)), ("Market Debt", _usd(coc.market_debt)), ("Equity Weight", _pct(wr.weight_equity,0)), ("Debt Weight", _pct(wr.weight_debt,0)), ("WACC", _pct(wr.wacc)))
+    html += _metrics(("Book Debt", _usd(d.book_debt)), ("Market Debt", _usd(coc.market_debt)), ("Equity Weight", _pct(wr.weight_equity,0)), ("Debt Weight", _pct(wr.weight_debt,0)), ("WACC", _pct(wr.wacc), f"ke×{wr.weight_equity:.0%} + kd×{wr.weight_debt:.0%}"))
     # Scorecard
     scores = {
         "WACC":              _score_wacc(wr.wacc),
@@ -224,7 +224,7 @@ def _render_coc(d, coc):
     return html
 
 
-def _render_growth(d, g, tv):
+def _render_growth(d, g, tv, wacc_val=0.09):
     html  = _section("Module 03 — Growth & Terminal Value", "Ch 11–12 · chgrowth.xls")
     html += _subsection("Three Growth Approaches")
     html += _formula(f"g(firm) = ROC × RIR = {g.roc:.2%} × {g.reinvestment_rate:.2%} = {g.fundamental_growth_firm:.2%}<br>g(equity) = ROE × Retention = {g.roe:.2%} × {g.retention_ratio:.2%} = {g.fundamental_growth_equity:.2%}", source="Damodaran Ch 11 p.278")
@@ -236,6 +236,9 @@ def _render_growth(d, g, tv):
         ["Recommended blend",    _pct(g.recommended_growth), g.recommended_basis],
     ], 4)
     html += _box(f"Recommended growth: <strong>{_pct(g.recommended_growth)}</strong> — {g.recommended_basis}")
+    # ROC score
+    s_roc,t_roc = _score_roc(g.roc, wacc_val if wacc_val else 0.09)
+    html += _scores_row([(s_roc, f"ROC {g.roc:.2%} vs WACC — {t_roc}")])
 
     if tv:
         html += _subsection("Terminal Value Consistency Checks")
@@ -258,7 +261,21 @@ def _render_growth(d, g, tv):
 def _render_fcff(d, r, price=0):
     tv_pct = r.pv_terminal_value / r.value_of_firm if r.value_of_firm > 0 else 0
     html  = _section("Module 02 — Cash Flow Valuation (FCFF 2-stage)", "Ch 10, 15 · fcff2st.xls · fcffginzu.xlsx")
-    html += _formula("FCFF = EBIT×(1−t) − Net_CapEx − ΔWC<br>Value_Firm = Σ PV(FCFF) + PV(TV)<br>Value_Equity = Value_Firm − Debt + Cash", source="Damodaran Ch 10 p.247; Ch 15 p.375")
+    g_used = r.inputs.get("g_high", 0)
+    n_used = r.inputs.get("n_high", 5)
+    g_s_used = r.inputs.get("g_stable", 0.03)
+    wacc_s_used = r.inputs.get("wacc_stable", 0)
+    rir_s_used = g_s_used / r.inputs.get("stable_roc", 0.12) if r.inputs.get("stable_roc") else 0
+    html += _formula(
+        f"FCFF = EBIT×(1−t) − Net_CapEx − ΔWC<br>"
+        f"Value_Firm = Σ PV(FCFF_1..{n_used}) + PV(TV)<br>"
+        f"Value_Equity = Value_Firm − Debt + Cash",
+        note=f"High-growth rate: <strong>{g_used:.2%}</strong> (auto from growth module) · "
+             f"Stable rate: <strong>{g_s_used:.2%}</strong> · "
+             f"Stable RIR: <strong>{rir_s_used:.1%}</strong> (= g/ROC = {g_s_used:.2%}/{r.inputs.get('stable_roc',0.12):.2%}) · "
+             f"Stable WACC: <strong>{wacc_s_used:.2%}</strong>",
+        source="Damodaran Ch 10 p.247; Ch 15 p.375"
+    )
 
     year_rows = [[str(row.year), _usd(row.ebit,0), _usd(row.nopat,0),
                   _usd(row.net_capex,0), _usd(row.delta_wc,0),
@@ -309,15 +326,29 @@ def _render_multiples(d, eq_m, fm):
         ]
         html += _table(["Multiple","Justified","Implied Price","vs Market"], rows)
         html += _box(f"ROE (high growth implied): {eq_m.roe_high:.2%} | ROE (stable): {eq_m.roe_stable:.2%}<br>PBV of {eq_m.pbv:.2f}× {'justified — ROE > ke' if eq_m.roe_high > eq_m.ke_high else 'unjustified — ROE < ke'}")
+        s_pe,t_pe = _score_mult("pe",  eq_m.pe_forward)
+        s_pb,t_pb = _score_mult("pbv", eq_m.pbv)
+        s_pg,t_pg = _score_mult("peg", eq_m.peg or 0)
+        html += _scores_row([(s_pe,f"PE {eq_m.pe_forward:.1f}× — {t_pe}"),
+                              (s_pb,f"PBV {eq_m.pbv:.2f}× — {t_pb}"),
+                              (s_pg,f"PEG {eq_m.peg:.2f}× — {t_pg}" if eq_m.peg else (0,"PEG N/A"))])
 
     if fm:
         html += _subsection("Firm Multiples (2-stage FCFF)")
         html += _formula("EV/EBIT_fwd = EV/NOPAT × (1−t)    EV/Sales = EV/NOPAT × margin    EV/IC = EV/NOPAT × ROIC", source="Damodaran Ch 20; firmmult.xls")
+        # Derive implied equity price from each EV
+        def _ev_to_price(ev):
+            if not ev or ev <= 0: return "—"
+            eq = ev - d.book_debt + d.cash
+            p = eq / d.shares if d.shares > 0 else 0
+            vs = f" → ${p:.2f}/share" if p > 0 else ""
+            return f"{_usd(ev,0)}{vs}"
+
         rows = [
-            ["EV/EBIT (forward)",  _x(fm.ev_ebit_forward),   _usd(fm.implied_ev_from_ebit,0) if fm.implied_ev_from_ebit else "N/A"],
+            ["EV/EBIT (forward)",  _x(fm.ev_ebit_forward),   _ev_to_price(fm.implied_ev_from_ebit)],
             ["EV/EBIT (trailing)", _x(fm.ev_ebit_trailing),  "—"],
-            ["EV/Sales (forward)", _x(fm.ev_sales_forward),  _usd(fm.implied_ev_from_sales,0) if fm.implied_ev_from_sales else "N/A"],
-            ["EV/IC",              _x(fm.ev_ic),              _usd(fm.implied_ev_from_ic,0) if fm.implied_ev_from_ic else "N/A"],
+            ["EV/Sales (forward)", _x(fm.ev_sales_forward),  _ev_to_price(fm.implied_ev_from_sales)],
+            ["EV/IC",              _x(fm.ev_ic),              _ev_to_price(fm.implied_ev_from_ic)],
         ]
         html += _table(["Multiple","Justified","Implied EV"], rows)
         html += _box(f"ROIC (high growth): {fm.roic_high:.2%} | ROIC (stable): {fm.roic_stable:.2%}<br>EV/IC = {fm.ev_ic:.2f}× — {'value creation: ROIC > WACC' if fm.roic_high > fm.wacc_high else 'value destruction: ROIC < WACC'}")
@@ -350,7 +381,7 @@ def _render_ocs(d, ocs):
     return html
 
 
-def _render_special(d, coc):
+def _render_special(d, coc, fcff_result=None):
     from special_cases import financial_firm_excess_returns, normalise_earnings
 
     wacc_val = coc.wacc_result.wacc if coc else 0.09
@@ -384,17 +415,24 @@ def _render_special(d, coc):
              if eva_curr > 0 else
              _warn(f"Negative EVA of {_usd(eva_curr,0)} — ROC {roc:.2%} is below WACC {wacc_val:.2%}. Growth at current returns destroys value."))
 
-    # Forward EVA projection (5 years at recommended growth)
+    # Forward EVA projection — ROC declines linearly from current to stable (12%)
     html += _subsection("EVA — 5-Year Projection")
-    html += _box("EVA₁ through EVA₅ assuming NOPAT grows at 10% with capital growing proportionally.")
+    stable_roc_ev = 0.12
+    html += _box(
+        f"NOPAT grows at 10% p.a. ROC declines from {roc:.2%} toward stable ROC of {stable_roc_ev:.2%} "
+        f"as competition erodes excess returns (Damodaran Ch 12: ROC → WACC in perpetuity)."
+    )
     eva_rows = []
-    nopat_t = nopat; ic_t = ic
+    nopat_t = nopat; ic_prev = ic
     for t in range(1,6):
-        nopat_t *= 1.10
-        ic_t    *= 1.10
-        eva_t    = nopat_t - wacc_val * ic_t
-        eva_rows.append([f"Year {t}", _usd(nopat_t,0), _usd(wacc_val*ic_t,0), _usd(eva_t,0), _pct(nopat_t/ic_t)])
-    html += _table(["Year","NOPAT","WACC Charge","EVA","ROC"], eva_rows)
+        nopat_t  *= 1.10
+        # ROC declines linearly: year t ROC = current + t/5*(stable-current)
+        roc_t     = roc + (t/5)*(stable_roc_ev - roc)
+        ic_t      = nopat_t / roc_t if roc_t > 0 else ic_prev
+        eva_t     = nopat_t - wacc_val * ic_t
+        eva_rows.append([f"Year {t}", _usd(nopat_t,0), f"{roc_t:.2%}", _usd(wacc_val*ic_t,0), _usd(eva_t,0)])
+        ic_prev   = ic_t
+    html += _table(["Year","NOPAT","ROC","WACC Charge","EVA"], eva_rows)
 
     # ── Distress ──────────────────────────────────────────────────────────────
     html += _subsection("2. Distressed Firm Analysis")
@@ -407,8 +445,12 @@ def _render_special(d, coc):
         f"Adjusted_Value = GC_Value × (1 − p_default) + Distress_Sale × p_default",
         source="Damodaran Ch 22 p.556; Ch 30 p.727; Moody's default data"
     )
-    gc_val      = d.equity_market_cap + d.book_debt
-    distress_val= d.book_debt * 0.6
+    # Use FCFF model firm value as going-concern if available, else fall back to market
+    if fcff_result and fcff_result.value_of_firm > 0:
+        gc_val = fcff_result.value_of_firm
+    else:
+        gc_val = d.equity_market_cap + d.book_debt
+    distress_val = d.book_debt * 0.6
     rows_dist = []
     for years in [1,3,5]:
         p = default_probability_from_rating(rating_simple, years)
@@ -468,23 +510,37 @@ def _render_special(d, coc):
         "Method 3: Industry/historical ROA × current assets",
         source="Damodaran Ch 22 p.541"
     )
-    if d.historical_eps and d.historical_revenue and len(d.historical_eps) == len(d.historical_revenue):
-        margins = [e/r for e,r in zip(d.historical_eps, d.historical_revenue) if r>0]
-        avg_margin = sum(margins)/len(margins) if margins else 0
-        norm = avg_margin * d.revenue
-        avg_eps = sum(d.historical_eps)/len(d.historical_eps) if d.historical_eps else d.net_income
-        curr_margin = d.net_income/d.revenue if d.revenue>0 else 0
-        html += _table(["Method","Earnings","Margin","vs Current"],[
-            ["Current (reported)", _usd(d.net_income,0), _pct(curr_margin), "—"],
-            ["Avg historical earnings", _usd(avg_eps*d.shares,0) if d.shares else "N/A", "—",
-             f"{(avg_eps*d.shares/d.net_income-1)*100:+.1f}%" if d.net_income and d.shares else "—"],
-            ["Avg margin × current rev", _usd(norm,0), _pct(avg_margin),
-             f"{(norm/d.net_income-1)*100:+.1f}%" if d.net_income else "—"],
-        ])
-        if d.net_income and abs(norm-d.net_income)/d.net_income > 0.15:
-            html += _warn(f"Current margin {_pct(curr_margin)} differs from historical avg {_pct(avg_margin)} by more than 15% — consider using normalised earnings for valuation.")
+    curr_margin = d.net_income/d.revenue if d.revenue > 0 else 0
+    if d.historical_eps and d.shares and d.shares > 0:
+        # Convert per-share EPS to total NI ($m) by multiplying by shares
+        hist_ni = [e * d.shares for e in d.historical_eps]
+        avg_ni  = sum(hist_ni) / len(hist_ni)
+        # Use historical revenue if available and same length, else estimate
+        if d.historical_revenue and len(d.historical_revenue) == len(d.historical_eps):
+            hist_rev = d.historical_revenue
         else:
-            html += _ok(f"Current earnings broadly in line with historical average ({_pct(curr_margin)} vs {_pct(avg_margin)} avg margin).")
+            # Estimate revenue series by back-calculating from current
+            hist_rev = [d.revenue * (0.85 ** (len(d.historical_eps)-i)) for i in range(len(d.historical_eps))]
+        margins  = [ni/r for ni,r in zip(hist_ni, hist_rev) if r > 0]
+        avg_mg   = sum(margins)/len(margins) if margins else curr_margin
+        norm_mg  = avg_mg * d.revenue
+        html += _table(["Method","Earnings","Margin","vs Current"],[
+            ["Current (reported)",        _usd(d.net_income,0), _pct(curr_margin), "—"],
+            ["Avg historical earnings",   _usd(avg_ni,0),       "—",
+             f"{(avg_ni/d.net_income-1)*100:+.1f}%" if d.net_income else "—"],
+            ["Avg hist margin × curr rev",_usd(norm_mg,0),      _pct(avg_mg),
+             f"{(norm_mg/d.net_income-1)*100:+.1f}%" if d.net_income else "—"],
+        ])
+        if d.net_income and abs(norm_mg - d.net_income) / d.net_income > 0.15:
+            html += _warn(
+                f"Current net margin {_pct(curr_margin)} differs from historical avg {_pct(avg_mg)} "
+                f"by more than 15% — consider using normalised earnings for valuation."
+            )
+        else:
+            html += _ok(
+                f"Earnings broadly in line with historical average "
+                f"({_pct(curr_margin)} current vs {_pct(avg_mg)} historical avg margin)."
+            )
     else:
         html += _box("Insufficient historical data for earnings normalisation.")
     return html
@@ -549,7 +605,7 @@ def _render_cover(d, coc, g, fcff, eq_m, fm, a):
 </div>'''
 
 
-def _render_audit(d):
+def _render_audit(d, g_use=0, wacc_v=0, a=None):
     rows = [
         ["Company name",        d.name,                     "yfinance info"],
         ["EBIT",                _usd(d.ebit,0),              "yfinance financials"],
@@ -577,6 +633,9 @@ def _render_audit(d):
         ["Avg debt maturity",   f"{d.avg_debt_maturity:.0f} years", "EDGAR / default"],
         ["Firm type",           {1:"Large firm",2:"Small/risky",3:"Financial"}.get(d.firm_type,""), ""],
         ["Data source",         d.source,                    ""],
+        ["Growth rate (FCFF)",  _pct(g_use) if g_use else "auto",  "From growth module blend"],
+        ["Stable WACC (TV)",    _pct(wacc_v*0.95) if wacc_v else "N/A",  "WACC × 0.95 for terminal period"],
+        ["Stable RIR (TV)",     f"{a.g_stable/a.stable_roc:.1%}" if (a and a.stable_roc) else "N/A",  f"g/ROC = {a.g_stable:.2%}/{a.stable_roc:.2%}" if a else ""],
     ]
     err = f'<div style="background:#292524;border:1px solid #78350f;border-radius:8px;padding:12px;color:#fde68a;font-size:0.85rem;margin:10px 0">⚠ Data warnings: {" · ".join(d.fetch_errors[:4])}</div>' if d.fetch_errors else ""
     return (_section("Data Audit Trail", "All inputs used in this report — every value, its source, and how it flows into calculations")
@@ -655,9 +714,11 @@ def generate_report(d: CompanyData, a: Optional[ReportAssumptions] = None) -> st
     except Exception as e: errors.append(f"Multiples: {e}")
 
     # Module 05: OCS
+    # Use g_stable directly (not g_implied) to avoid infinite firm values for
+    # high-growth firms where FCFF/EV << WACC. This matches capstru.xlsx approach.
     ocs = None
     try:
-        if a.run_ocs and d.fcff > 0:
+        if a.run_ocs and d.fcff > 0 and d.equity_market_cap > 0:
             ocs = optimal_capital_structure(
                 ebitda=d.ebitda or d.ebit+d.depreciation, depreciation=d.depreciation, ebit=d.ebit,
                 interest_expense=d.interest_expense, tax_rate=d.tax_rate,
@@ -673,12 +734,12 @@ def generate_report(d: CompanyData, a: Optional[ReportAssumptions] = None) -> st
     body = _render_cover(d, coc, g_result, fcff_result, eq_m, fm, a)
     if errors: body += "".join(_warn(f"Module error: {e}") for e in errors)
     if coc:        body += _render_coc(d, coc)
-    if g_result:   body += _render_growth(d, g_result, tv_result)
+    if g_result:   body += _render_growth(d, g_result, tv_result, wacc_v)
     if fcff_result:body += _render_fcff(d, fcff_result, d.price)
     if eq_m or fm: body += _render_multiples(d, eq_m, fm)
     if ocs:        body += _render_ocs(d, ocs)
-    if coc:        body += _render_special(d, coc)
-    body += _render_audit(d)
+    if coc:        body += _render_special(d, coc, fcff_result)
+    body += _render_audit(d, g_use, wacc_v, a)
 
     return f'''<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
