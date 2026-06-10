@@ -260,32 +260,56 @@ def _get_cik(ticker: str) -> Optional[str]:
 def _get_xbrl_fact(facts: dict, *concept_names: str, form: str = "10-K",
                    annual: bool = True) -> Optional[float]:
     """
-    Try multiple XBRL concept names; return most recent annual value.
+    Try multiple XBRL concept names; return most recent full-year value.
 
-    Critical: filters to fp="FY" (full year) and form="10-K" only.
-    This prevents pulling quarterly figures (Q1/Q2/Q3/Q4) which EDGAR
-    may return alongside annual data for the same concept.
-    A quarterly revenue figure labelled as the most recent filing will
-    be ~4× smaller than annual, causing EBIT margins above 100%.
+    Strategy (in priority order):
+    1. 10-K filing with fp="FY" — the most reliable annual figure.
+    2. If no 10-K/FY found, sum the four most recent distinct quarterly
+       values (10-Q with fp in Q1/Q2/Q3/Q4) to construct a trailing
+       twelve-month figure.  This is the fallback for companies that
+       file under a different schema or have delayed 10-K availability.
+
+    The fp="FY" filter is the critical guard against the quarterly-
+    revenue bug: EDGAR stores every historical filing, so without this
+    filter the most-recently-indexed record may be a 10-Q quarter worth
+    ~25% of the annual figure.
     """
     us_gaap = facts.get("us-gaap", {})
     ifrs    = facts.get("ifrs-full", {})
 
     for name in concept_names:
         for ns in [us_gaap, ifrs]:
-            data = ns.get(name, {})
+            data  = ns.get(name, {})
             units = data.get("units", {}).get("USD", [])
             if not units:
                 continue
-            # Strict annual filter: must be 10-K AND fp=FY
-            # fp=FY means full fiscal year; excludes Q1/Q2/Q3/Q4 quarterly filings
-            filtered = [x for x in units
-                        if x.get("form") == "10-K"
-                        and x.get("val") is not None
-                        and x.get("fp") == "FY"]
-            if filtered:
-                filtered.sort(key=lambda x: x.get("end", ""), reverse=True)
-                return float(filtered[0]["val"])
+
+            # ── Priority 1: annual 10-K with fp=FY ───────────────────────────
+            fy = [x for x in units
+                  if x.get("form") == "10-K"
+                  and x.get("fp")   == "FY"
+                  and x.get("val")  is not None]
+            if fy:
+                fy.sort(key=lambda x: x.get("end", ""), reverse=True)
+                return float(fy[0]["val"])
+
+            # ── Priority 2: sum four most recent distinct quarters (TTM) ─────
+            quarters = [x for x in units
+                        if x.get("form") == "10-Q"
+                        and x.get("fp") in ("Q1", "Q2", "Q3", "Q4")
+                        and x.get("val") is not None]
+            if len(quarters) >= 4:
+                # De-duplicate by end date, keep most recent per end date
+                by_end: dict[str, float] = {}
+                for q in quarters:
+                    end = q.get("end", "")
+                    if end not in by_end:
+                        by_end[end] = float(q["val"])
+                sorted_ends = sorted(by_end.keys(), reverse=True)
+                if len(sorted_ends) >= 4:
+                    ttm = sum(by_end[e] for e in sorted_ends[:4])
+                    return ttm
+
     return None
 
 def _get_xbrl_shares(facts: dict) -> Optional[float]:
@@ -293,45 +317,77 @@ def _get_xbrl_shares(facts: dict) -> Optional[float]:
     Get diluted weighted-average shares outstanding in millions.
 
     Priority:
-    1. Derive from EPS: diluted_shares = NI / EPS_diluted
-       This gives the correct diluted weighted-average count used in EPS reporting,
-       which is what Damodaran uses for per-share equity value.
-    2. Fall back to CommonStockSharesOutstanding (basic, as filed)
+    1. WeightedAverageNumberOfDilutedSharesOutstanding (10-K, fp=FY)
+       — the exact denominator used in diluted EPS; correct for valuation.
+    2. WeightedAverageNumberOfSharesOutstandingBasic (basic, fallback)
+    3. NI / EPS_diluted (derived, last resort)
 
-    CommonStockSharesOutstanding is the WRONG number to use:
-    it is the raw share count on the balance sheet date, not the diluted
-    weighted-average. For META it returns ~1,000m (Class A only) vs
-    ~2,574m diluted weighted-average. Using it overstates EPS and VPS by ~2.6×.
+    CommonStockSharesOutstanding is intentionally NOT used: it is the
+    balance-sheet share count at period end, not the weighted average.
+    For multi-class companies (META, GOOGL, AMZN) it typically returns
+    only one share class, understating the true diluted count by 2–3×.
     """
     us_gaap = facts.get("us-gaap", {})
 
-    # Method 1: derive diluted shares from NI / EPS_diluted (most accurate)
+    def _annual_shares(concept: str) -> Optional[float]:
+        data  = us_gaap.get(concept, {})
+        units = data.get("units", {}).get("shares", [])
+        fy    = [x for x in units
+                 if x.get("form") == "10-K"
+                 and x.get("fp")   == "FY"
+                 and x.get("val")  is not None]
+        if fy:
+            fy.sort(key=lambda x: x.get("end", ""), reverse=True)
+            return float(fy[0]["val"]) / 1e6
+        return None
+
+    # Method 1: diluted weighted-average (preferred)
+    v = _annual_shares("WeightedAverageNumberOfDilutedSharesOutstanding")
+    if v and 10 < v < 500_000:
+        return v
+
+    # Method 2: basic weighted-average
+    v = _annual_shares("WeightedAverageNumberOfSharesOutstandingBasic")
+    if v and 10 < v < 500_000:
+        return v
+
+    # Method 3: derive from NI / EPS_diluted
     ni_data  = us_gaap.get("NetIncomeLoss", {}).get("units", {}).get("USD", [])
     eps_data = us_gaap.get("EarningsPerShareDiluted", {}).get("units", {}).get("USD/shares", [])
-
-    ni_annual  = [x for x in ni_data  if x.get("form")=="10-K" and x.get("fp")=="FY"]
-    eps_annual = [x for x in eps_data if x.get("form")=="10-K" and x.get("fp")=="FY"]
-
-    if ni_annual and eps_annual:
-        ni_annual.sort(key=lambda x: x.get("end",""),  reverse=True)
-        eps_annual.sort(key=lambda x: x.get("end",""), reverse=True)
-        ni_val  = float(ni_annual[0]["val"])
-        eps_val = float(eps_annual[0]["val"])
+    ni_fy    = [x for x in ni_data  if x.get("form") == "10-K" and x.get("fp") == "FY"]
+    eps_fy   = [x for x in eps_data if x.get("form") == "10-K" and x.get("fp") == "FY"]
+    if ni_fy and eps_fy:
+        ni_fy.sort(key=lambda x: x.get("end", ""),  reverse=True)
+        eps_fy.sort(key=lambda x: x.get("end", ""), reverse=True)
+        ni_val  = float(ni_fy[0]["val"])
+        eps_val = float(eps_fy[0]["val"])
         if eps_val != 0 and abs(eps_val) > 0.01:
-            diluted_shares_m = ni_val / eps_val / 1e6
-            # Sanity check: must be between 10m and 500bn shares
-            if 10 < diluted_shares_m < 500_000:
-                return diluted_shares_m
+            v = ni_val / eps_val / 1e6
+            if 10 < v < 500_000:
+                return v
 
-    # Method 2: fall back to basic shares (less accurate but available)
-    for name in ["CommonStockSharesOutstanding", "EntityCommonStockSharesOutstanding"]:
-        data = us_gaap.get(name, {})
-        units = data.get("units", {}).get("shares", [])
-        annual = [x for x in units if x.get("form")=="10-K"]
-        if annual:
-            annual.sort(key=lambda x: x.get("end",""), reverse=True)
-            return float(annual[0]["val"]) / 1e6
+    return None
 
+
+def _check_share_consistency(shares_m: float, market_cap_usd: float,
+                              price: float) -> Optional[str]:
+    """
+    Consistency check: |market_cap / price − reported_shares| / reported_shares > 5%
+    returns a warning string, else None.
+    Catches multi-class share undercounts before they inflate VPS.
+    """
+    if not (shares_m and market_cap_usd and price and price > 0):
+        return None
+    implied_shares_m = (market_cap_usd / 1e6) / price
+    error = abs(implied_shares_m - shares_m) / shares_m
+    if error > 0.05:
+        return (
+            f"Share count inconsistency: EDGAR reports {shares_m:,.0f}m shares but "
+            f"market_cap / price implies {implied_shares_m:,.0f}m "
+            f"(divergence {error:.0%}). "
+            f"Possible multi-class undercount (e.g. Class A only). "
+            f"Using market_cap / price as diluted share count."
+        )
     return None
 
 def fetch_from_edgar(ticker: str) -> dict:
@@ -421,11 +477,16 @@ def fetch_from_edgar(ticker: str) -> dict:
             result["tax_rate"] = max(0.05, min(0.40, tax_exp / pre_tax))
 
         # ── Balance sheet ────────────────────────────────────────────────────
-        result["book_debt"] = (
-            (g("LongTermDebt", "LongTermDebtNoncurrent") or 0) +
-            (g("ShortTermBorrowings", "NotesPayableCurrent",
-               "DebtCurrent") or 0)
-        ) or g("LongTermDebtAndCapitalLeaseObligations") or 0
+        # Financial debt only: LongTermDebt + DebtCurrent.
+        # Explicitly exclude OperatingLeaseLiability, FinanceLeaseLiabilityNoncurrent,
+        # and FinanceLeaseLiabilityCurrent — these are not financial debt and their
+        # inclusion inflates the WACC debt weight and distorts the capital structure module.
+        long_term_debt = g("LongTermDebt", "LongTermDebtNoncurrent") or 0
+        short_term_debt = g("DebtCurrent", "ShortTermBorrowings", "NotesPayableCurrent") or 0
+        result["book_debt"] = long_term_debt + short_term_debt
+        # Fallback only if both components return zero (very rare)
+        if result["book_debt"] == 0:
+            result["book_debt"] = g("LongTermDebtAndCapitalLeaseObligations") or 0
 
         result["book_equity"] = g(
             "StockholdersEquity",
@@ -622,7 +683,13 @@ def get_company_data(
     if mktcap_v == 0 and price_v > 0 and shares_m > 0:
         mktcap_v = price_v * shares_m   # derive from price × shares
 
-    # Beta — priority: manual → yfinance → Damodaran industry → total market
+    # Share count consistency check
+    share_warning = _check_share_consistency(shares_m, yf_data.get("market_cap") or 0, price_v)
+    if share_warning:
+        # Use market_cap / price as the more reliable diluted count
+        if price_v > 0 and yf_data.get("market_cap"):
+            shares_m = (yf_data["market_cap"] / 1e6) / price_v
+        errors.append(share_warning)
     beta_src = "yfinance"
     beta_v   = manual_beta or yf_data.get("beta") or 0.0
     if beta_v == 0:
