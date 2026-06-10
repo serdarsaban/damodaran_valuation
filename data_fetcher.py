@@ -1,105 +1,178 @@
 """
 data_fetcher.py
 ===============
-Live data connection for the Damodaran Valuation Toolkit.
+Data layer for the Damodaran Valuation Toolkit.
 
-Sources
--------
-  yfinance          — beta, market cap, price, EPS, book value, financials
-  SEC EDGAR API     — 10-K filings: debt schedule, lease commitments, R&D
-  FRED (St Louis)   — 10-yr Treasury yield (risk-free rate)
-  Damodaran site    — ERP by country, industry betas (cached Jan-2026 values)
+Priority order:
+  1. SEC EDGAR XBRL API  — all financial statement data (free, no key, 10 req/s)
+  2. FRED                — risk-free rate / 10-yr Treasury (free, API key optional)
+  3. yfinance            — price, market cap, beta ONLY (3 fields, retry on throttle)
+  4. Damodaran industry  — beta fallback from wacccalc.xls Industry Averages (Jan 2026)
+  5. User input          — price and market cap can be entered manually on home page
+  6. Placeholder         — clearly flagged if all else fails
 
-Rate limiting strategy
-----------------------
-  yfinance: cache all ticker data in st.session_state on first fetch.
-            Never call inside a loop or on every rerender.
-            One Ticker() object → .info + .financials + .balance_sheet
-            fetched together, stored under session_state["yf_cache"][ticker].
+EDGAR covers:
+  EBIT, interest, net income, revenue, depreciation, book debt, book equity,
+  cash, total assets, capex, delta_wc, shares, EPS, tax rate
 
-  EDGAR:    REST API, free, no key. Rate limit: ~10 req/sec.
-            Cache CIK lookup + latest 10-K accession number.
-            Only fetch the specific financial facts needed.
-
-  FRED:     Single GET per session for the 10-yr yield.
-            Cache in session_state["fred_rf"].
-
-  Fallback: If any fetch fails, fall back to the placeholder values
-            with a visible warning badge — never silently use stale data.
-
-Usage in Streamlit pages
-------------------------
-    from data_fetcher import fetch_company_data, get_risk_free_rate
-    data = fetch_company_data("AAPL")   # uses st.session_state cache
-    rf   = get_risk_free_rate()
+yfinance used only for:
+  price (currentPrice), market_cap (marketCap), beta — with retry + fallback
 """
 
 from __future__ import annotations
 import math
 import time
+import json
 import requests
 from dataclasses import dataclass, field
 from typing import Optional
 
-# ── Streamlit import (graceful degradation if not in Streamlit context) ──────
 try:
     import streamlit as st
     _IN_STREAMLIT = True
 except ImportError:
     _IN_STREAMLIT = False
-    class _FakeState(dict):
-        pass
-    st = type("st", (), {"session_state": _FakeState()})()
+    class _FakeSS(dict): pass
+    st = type("st", (), {"session_state": _FakeSS()})()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CompanyData — the unified data object all modules consume
+# Damodaran Industry Beta Table
+# Source: wacccalc.xls → Industry Averages (US) sheet (Jan 2026)
+# Columns: unlevered_beta, levered_beta, tax_rate
+# ─────────────────────────────────────────────────────────────────────────────
+
+INDUSTRY_BETAS: dict[str, dict] = {
+    "Advertising":                       {"unlevered": 0.8264, "levered": 1.1813, "tax": 0.3348},
+    "Aerospace/Defense":                 {"unlevered": 1.0580, "levered": 1.1599, "tax": 0.2827},
+    "Air Transport":                     {"unlevered": 0.6108, "levered": 0.9786, "tax": 0.1689},
+    "Apparel":                           {"unlevered": 0.8600, "levered": 0.9927, "tax": 0.2809},
+    "Auto & Truck":                      {"unlevered": 0.5901, "levered": 1.0950, "tax": 0.0621},
+    "Auto Parts":                        {"unlevered": 1.1437, "levered": 1.3482, "tax": 0.2543},
+    "Bank (Money Center)":               {"unlevered": 0.3377, "levered": 0.8068, "tax": 0.3066},
+    "Banks (Regional)":                  {"unlevered": 0.3722, "levered": 0.5261, "tax": 0.2766},
+    "Beverage (Alcoholic)":              {"unlevered": 0.8944, "levered": 1.0555, "tax": 0.2599},
+    "Beverage (Soft)":                   {"unlevered": 0.9755, "levered": 1.1375, "tax": 0.2438},
+    "Broadcasting":                      {"unlevered": 0.8334, "levered": 1.2962, "tax": 0.3110},
+    "Brokerage & Investment Banking":    {"unlevered": 0.4114, "levered": 1.1595, "tax": 0.2782},
+    "Building Materials":                {"unlevered": 0.9278, "levered": 1.1159, "tax": 0.2317},
+    "Business & Consumer Services":      {"unlevered": 0.9963, "levered": 1.1938, "tax": 0.3562},
+    "Cable TV":                          {"unlevered": 0.6955, "levered": 0.9130, "tax": 0.3420},
+    "Chemical (Basic)":                  {"unlevered": 0.7528, "levered": 0.9351, "tax": 0.3210},
+    "Chemical (Diversified)":            {"unlevered": 0.9872, "levered": 1.1728, "tax": 0.2586},
+    "Chemical (Specialty)":              {"unlevered": 0.9128, "levered": 1.0259, "tax": 0.2758},
+    "Computer Services":                 {"unlevered": 0.9858, "levered": 1.1596, "tax": 0.2031},
+    "Computers/Peripherals":             {"unlevered": 1.1719, "levered": 1.2106, "tax": 0.2537},
+    "Drugs (Biotechnology)":             {"unlevered": 1.0616, "levered": 1.1041, "tax": 0.2011},
+    "Drugs (Pharmaceutical)":            {"unlevered": 0.9493, "levered": 1.0272, "tax": 0.1942},
+    "Education":                         {"unlevered": 0.9468, "levered": 1.1274, "tax": 0.2981},
+    "Electrical Equipment":              {"unlevered": 1.1429, "levered": 1.2377, "tax": 0.3177},
+    "Electronics (Consumer & Office)":   {"unlevered": 1.3786, "levered": 1.3721, "tax": 0.2505},
+    "Electronics (General)":             {"unlevered": 1.0143, "levered": 1.0278, "tax": 0.2675},
+    "Engineering/Construction":          {"unlevered": 1.1910, "levered": 1.3073, "tax": 0.3458},
+    "Entertainment":                     {"unlevered": 0.9861, "levered": 1.2057, "tax": 0.2915},
+    "Environmental & Waste Services":    {"unlevered": 0.9416, "levered": 1.2844, "tax": 0.4282},
+    "Farming/Agriculture":               {"unlevered": 0.5791, "levered": 0.8433, "tax": 0.3192},
+    "Food Processing":                   {"unlevered": 0.8237, "levered": 0.9938, "tax": 0.3063},
+    "Food Wholesalers":                  {"unlevered": 1.2573, "levered": 1.4130, "tax": 0.3678},
+    "Green & Renewable Energy":          {"unlevered": 0.6763, "levered": 1.3197, "tax": 0.2438},
+    "Healthcare Products":               {"unlevered": 0.9042, "levered": 0.9893, "tax": 0.2558},
+    "Healthcare Support Services":       {"unlevered": 0.9078, "levered": 1.0538, "tax": 0.3853},
+    "Healthcare Information Technology": {"unlevered": 0.8363, "levered": 0.9498, "tax": 0.2262},
+    "Homebuilding":                      {"unlevered": 0.9204, "levered": 1.2865, "tax": 0.3135},
+    "Hospitals/Healthcare Facilities":   {"unlevered": 0.5889, "levered": 0.9728, "tax": 0.2246},
+    "Hotel/Gaming":                      {"unlevered": 0.8285, "levered": 1.1808, "tax": 0.1802},
+    "Household Products":                {"unlevered": 0.9101, "levered": 1.0279, "tax": 0.2766},
+    "Information Services":              {"unlevered": 1.0446, "levered": 1.1150, "tax": 0.3025},
+    "Insurance (General)":               {"unlevered": 0.8039, "levered": 1.0293, "tax": 0.2645},
+    "Insurance (Life)":                  {"unlevered": 0.7538, "levered": 1.0418, "tax": 0.2666},
+    "Insurance (Prop/Cas.)":             {"unlevered": 0.6929, "levered": 0.8291, "tax": 0.2861},
+    "Investments & Asset Management":    {"unlevered": 0.7287, "levered": 1.0982, "tax": 0.1587},
+    "Machinery":                         {"unlevered": 1.1124, "levered": 1.2266, "tax": 0.2895},
+    "Metals & Mining":                   {"unlevered": 0.9052, "levered": 1.2809, "tax": 0.3352},
+    "Oil/Gas (Integrated)":              {"unlevered": 0.7643, "levered": 0.8078, "tax": 0.3764},
+    "Oil/Gas (Production and Exploration)": {"unlevered": 0.9142, "levered": 1.2667, "tax": 0.4146},
+    "Oil/Gas Distribution":              {"unlevered": 0.6690, "levered": 0.9642, "tax": 0.1753},
+    "Oilfield Services/Equipment":       {"unlevered": 1.3188, "levered": 1.5433, "tax": 0.2868},
+    "Packaging & Container":             {"unlevered": 0.6951, "levered": 0.9472, "tax": 0.2661},
+    "Paper/Forest Products":             {"unlevered": 0.5950, "levered": 0.8355, "tax": 0.1943},
+    "Power":                             {"unlevered": 0.5285, "levered": 0.8294, "tax": 0.3068},
+    "Publishing & Newspapers":           {"unlevered": 0.8830, "levered": 1.1471, "tax": 0.1816},
+    "R.E.I.T.":                          {"unlevered": 0.4266, "levered": 0.7860, "tax": 0.0223},
+    "Real Estate (Development)":         {"unlevered": 0.8189, "levered": 1.0216, "tax": 0.6982},
+    "Real Estate (General/Diversified)": {"unlevered": 1.4750, "levered": 1.8190, "tax": 0.2079},
+    "Real Estate (Operations & Svcs)":   {"unlevered": 0.8949, "levered": 1.3023, "tax": 0.2241},
+    "Recreation":                        {"unlevered": 0.9865, "levered": 1.2118, "tax": 0.2319},
+    "Restaurant/Dining":                 {"unlevered": 0.7393, "levered": 0.8927, "tax": 0.3298},
+    "Retail (Automotive)":               {"unlevered": 0.8463, "levered": 1.1754, "tax": 0.3653},
+    "Retail (Building Supply)":          {"unlevered": 1.2904, "levered": 1.4423, "tax": 0.3706},
+    "Retail (General)":                  {"unlevered": 0.8506, "levered": 1.0321, "tax": 0.3419},
+    "Retail (Grocery and Food)":         {"unlevered": 0.7473, "levered": 1.0483, "tax": 0.3511},
+    "Retail (Online)":                   {"unlevered": 1.3923, "levered": 1.3952, "tax": 0.2234},
+    "Retail (Special Lines)":            {"unlevered": 0.8460, "levered": 1.0744, "tax": 0.3582},
+    "Semiconductor":                     {"unlevered": 1.1684, "levered": 1.2145, "tax": 0.2175},
+    "Semiconductor Equipment":           {"unlevered": 1.1738, "levered": 1.2331, "tax": 0.2029},
+    "Software (Entertainment)":          {"unlevered": 1.1318, "levered": 1.1151, "tax": 0.1235},
+    "Software (Internet)":               {"unlevered": 1.2936, "levered": 1.2862, "tax": 0.3506},
+    "Software (System & Application)":   {"unlevered": 1.0611, "levered": 1.1039, "tax": 0.2252},
+    "Steel":                             {"unlevered": 0.9037, "levered": 1.3130, "tax": 0.3032},
+    "Telecom (Wireless)":                {"unlevered": 0.5087, "levered": 1.1501, "tax": 0.2178},
+    "Telecom. Equipment":                {"unlevered": 1.1970, "levered": 1.2426, "tax": 0.1918},
+    "Telecom. Services":                 {"unlevered": 0.6911, "levered": 1.0685, "tax": 0.3114},
+    "Tobacco":                           {"unlevered": 0.9450, "levered": 1.0856, "tax": 0.3247},
+    "Transportation":                    {"unlevered": 0.7652, "levered": 0.8571, "tax": 0.3584},
+    "Transportation (Railroads)":        {"unlevered": 0.9200, "levered": 1.0476, "tax": 0.3699},
+    "Trucking":                          {"unlevered": 0.9173, "levered": 1.3243, "tax": 0.3923},
+    "Utility (General)":                 {"unlevered": 0.4191, "levered": 0.5924, "tax": 0.3127},
+    "Utility (Water)":                   {"unlevered": 0.7663, "levered": 1.0855, "tax": 0.3171},
+    "Total Market":                      {"unlevered": 0.7040, "levered": 1.0641, "tax": 0.2809},
+}
+
+INDUSTRY_NAMES_BETA = sorted(k for k in INDUSTRY_BETAS if k != "Total Market")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CompanyData
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class CompanyData:
     ticker:             str
     name:               str
-    # Income statement
-    ebit:               float       # $m
-    interest_expense:   float       # $m
-    net_income:         float       # $m
-    revenue:            float       # $m
-    ebitda:             float       # $m
-    depreciation:       float       # $m
-    # Balance sheet
-    book_debt:          float       # $m
-    book_equity:        float       # $m
-    cash:               float       # $m
-    total_assets:       float       # $m
-    # Cash flow
-    capex:              float       # $m
-    delta_wc:           float       # $m  (change in working capital)
-    # Market data
-    equity_market_cap:  float       # $m
+    ebit:               float
+    interest_expense:   float
+    net_income:         float
+    revenue:            float
+    ebitda:             float
+    depreciation:       float
+    book_debt:          float
+    book_equity:        float
+    cash:               float
+    total_assets:       float
+    capex:              float
+    delta_wc:           float
+    equity_market_cap:  float
     beta_levered:       float
-    price:              float       # $ per share
-    shares:             float       # m shares outstanding
-    eps:                float       # $ per share (trailing)
-    # Derived / market rates
-    rf:                 float       # risk-free rate
-    erp:                float       # equity risk premium
+    price:              float
+    shares:             float
+    eps:                float
+    rf:                 float
+    erp:                float
     tax_rate:           float
     country_spread:     float
-    firm_type:          int         # 1=large, 2=small, 3=financial
-    avg_debt_maturity:  float       # years
-    # Metadata
-    source:             str         # "live" | "partial" | "placeholder"
+    firm_type:          int
+    avg_debt_maturity:  float
+    source:             str
     fetch_errors:       list[str] = field(default_factory=list)
-    # Historical series (for growth module)
     historical_eps:     list[float] = field(default_factory=list)
     historical_revenue: list[float] = field(default_factory=list)
-    # FCFF
     fcff:               float = 0.0
+    beta_source:        str = "yfinance"   # "yfinance" | "damodaran" | "manual"
+    industry:           Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Placeholder data (fallback)
+# Placeholders
 # ─────────────────────────────────────────────────────────────────────────────
 
 PLACEHOLDERS: dict[str, dict] = {
@@ -117,22 +190,14 @@ PLACEHOLDERS: dict[str, dict] = {
                  equity_market_cap=3_100_000, beta_levered=0.90, price=415.0,
                  shares=7_430, eps=9.70, tax_rate=0.13, avg_debt_maturity=6,
                  firm_type=1, erp=0.055, country_spread=0.0),
-    "TSLA": dict(name="Tesla Inc.", ebit=8_700, interest_expense=590,
-                 net_income=15_000, revenue=97_000, ebitda=13_500,
-                 depreciation=4_600, book_debt=8_800, book_equity=60_000,
-                 cash=26_000, total_assets=106_000, capex=8_900, delta_wc=800,
-                 equity_market_cap=600_000, beta_levered=2.30, price=190.0,
-                 shares=3_190, eps=4.30, tax_rate=0.10, avg_debt_maturity=4,
-                 firm_type=2, erp=0.055, country_spread=0.0),
-    "JPM":  dict(name="JPMorgan Chase", ebit=55_000, interest_expense=32_000,
-                 net_income=49_600, revenue=158_000, ebitda=62_000,
-                 depreciation=7_000, book_debt=400_000, book_equity=340_000,
-                 cash=30_000, total_assets=3_900_000, capex=3_000, delta_wc=0,
-                 equity_market_cap=580_000, beta_levered=1.10, price=200.0,
-                 shares=2_900, eps=16.80, tax_rate=0.22, avg_debt_maturity=5,
-                 firm_type=3, erp=0.055, country_spread=0.0),
+    "META": dict(name="Meta Platforms, Inc.", ebit=87_097, interest_expense=1_165,
+                 net_income=60_458, revenue=200_966, ebitda=105_713,
+                 depreciation=18_616, book_debt=83_897, book_equity=217_243,
+                 cash=35_873, total_assets=366_021, capex=69_691, delta_wc=885,
+                 equity_market_cap=1_487_478, beta_levered=1.229, price=585.99,
+                 shares=2_196, eps=27.51, tax_rate=0.2964, avg_debt_maturity=5,
+                 firm_type=1, erp=0.055, country_spread=0.0),
 }
-
 
 def _make_placeholder(ticker: str) -> CompanyData:
     p = PLACEHOLDERS.get(ticker.upper(), dict(
@@ -144,283 +209,42 @@ def _make_placeholder(ticker: str) -> CompanyData:
         shares=240, eps=4.0, tax_rate=0.25, avg_debt_maturity=5,
         firm_type=1, erp=0.055, country_spread=0.0,
     ))
-    return CompanyData(
-        ticker=ticker.upper(), source="placeholder",
-        rf=0.045,
-        fcff=0.0,
-        **p,
-    )
+    return CompanyData(ticker=ticker.upper(), source="placeholder", rf=0.045,
+                       fcff=0.0, beta_source="placeholder", **p)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FRED — 10-yr Treasury yield
+# EDGAR XBRL — financial statement data
 # ─────────────────────────────────────────────────────────────────────────────
 
-FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
+EDGAR_BASE    = "https://data.sec.gov"
+EDGAR_HEADERS = {"User-Agent": "DamodaranValuationApp research@damodaran.app"}
 
-def get_risk_free_rate(fred_api_key: str = "") -> float:
-    """
-    Fetch the current 10-year US Treasury yield from FRED.
-
-    Returns the most recent daily observation.
-    Caches result in st.session_state["fred_rf"] for the session.
-
-    Parameters
-    ----------
-    fred_api_key : FRED API key (free at https://fred.stlouisfed.org/docs/api/)
-                   If empty, uses the public endpoint (may be rate-limited).
-    """
-    cache_key = "fred_rf"
-    if _IN_STREAMLIT and cache_key in st.session_state:
-        return st.session_state[cache_key]
-
-    try:
-        params = {
-            "series_id":     "DGS10",
-            "api_key":       fred_api_key or "FRED_API_KEY_HERE",
-            "file_type":     "json",
-            "sort_order":    "desc",
-            "limit":         5,
-            "observation_start": "2020-01-01",
-        }
-        resp = requests.get(FRED_URL, params=params, timeout=8)
-        resp.raise_for_status()
-        obs = resp.json()["observations"]
-        # Find most recent non-null observation
-        for o in obs:
-            if o["value"] not in (".", ""):
-                rf = float(o["value"]) / 100  # FRED gives percentage
-                if _IN_STREAMLIT:
-                    st.session_state[cache_key] = rf
-                return rf
-    except Exception:
-        pass
-
-    # Fallback: use most recent known value
-    return 0.045
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# yfinance fetcher
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _fetch_yfinance(ticker: str) -> dict:
-    """
-    Fetch all needed data from yfinance in the minimum number of calls.
-
-    Caches raw results under st.session_state["yf_cache"][ticker].
-    Only call on button-click, never on rerender.
-
-    Returns a dict of raw values (may contain None for missing fields).
-    """
-    cache_key = f"yf_cache"
-    if _IN_STREAMLIT:
-        if cache_key not in st.session_state:
-            st.session_state[cache_key] = {}
-        if ticker in st.session_state[cache_key]:
-            return st.session_state[cache_key][ticker]
-
-    try:
-        import yfinance as yf
-        t = yf.Ticker(ticker)
-
-        # Three calls — do them together, cache together
-        info    = t.info or {}
-        fin     = t.financials              # income statement (annual)
-        bal     = t.balance_sheet           # balance sheet (annual)
-        cf      = t.cashflow                # cash flow statement
-        hist    = t.history(period="max",   # for historical series
-                            interval="3mo",
-                            auto_adjust=True)
-
-        raw = {
-            "info":    info,
-            "fin":     fin,
-            "bal":     bal,
-            "cf":      cf,
-            "hist":    hist,
-        }
-
-        if _IN_STREAMLIT:
-            st.session_state[cache_key][ticker] = raw
-        return raw
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _safe_get(df, row_names: list[str], col: int = 0) -> Optional[float]:
-    """Try multiple row name variants; return first found."""
-    if df is None:
-        return None
-    for name in row_names:
-        try:
-            val = df.loc[name].iloc[col]
-            if val is not None and not (isinstance(val, float) and math.isnan(val)):
-                return float(val)
-        except (KeyError, IndexError):
-            continue
-    return None
-
-
-def _parse_yfinance(ticker: str, raw: dict) -> CompanyData:
-    """
-    Parse raw yfinance data into a CompanyData object.
-
-    Row name variants are needed because yfinance labels change across
-    versions and ticker types.
-    """
-    errors = []
-    info = raw.get("info", {})
-    fin  = raw.get("fin")
-    bal  = raw.get("bal")
-    cf   = raw.get("cf")
-    hist = raw.get("hist")
-
-    def g(val, fallback=0.0, label=""):
-        if val is None:
-            if label: errors.append(f"Missing: {label}")
-            return fallback
-        return val / 1e6 if abs(val) > 1e4 else val  # convert to $m if in raw $
-
-    # ── Income statement ─────────────────────────────────────────────────────
-    ebit  = _safe_get(fin, ["EBIT", "Ebit", "Operating Income", "OperatingIncome"])
-    ebit  = g(ebit, 0.0, "EBIT") if ebit else g(None, 0.0, "EBIT")
-    # If EBIT missing, derive: revenue - operating expenses
-    if ebit == 0:
-        rev_raw = _safe_get(fin, ["Total Revenue", "Revenue"])
-        oe_raw  = _safe_get(fin, ["Total Operating Expenses", "Operating Expenses"])
-        if rev_raw and oe_raw:
-            ebit = g(rev_raw - oe_raw)
-
-    interest = abs(g(_safe_get(fin, [
-        "Interest Expense", "Interest Expense Non Operating",
-        "Net Interest Income"]), 0.0, "Interest Expense"))
-
-    ni       = g(_safe_get(fin, ["Net Income", "Net Income Common Stockholders",
-                                  "Net Income From Continuing Operations"]), 0.0, "Net Income")
-
-    revenue  = g(_safe_get(fin, ["Total Revenue", "Revenue"]), 0.0, "Revenue")
-
-    da       = g(_safe_get(cf, ["Depreciation", "Depreciation And Amortization",
-                                 "Depreciation Amortization Depletion"]), 0.0)
-
-    ebitda   = ebit + da if ebit and da else g(info.get("ebitda"), 0.0)
-
-    # ── Balance sheet ─────────────────────────────────────────────────────────
-    book_debt = g(_safe_get(bal, ["Total Debt", "Long Term Debt And Capital Lease Obligation",
-                                   "Long Term Debt"]), 0.0)
-
-    book_eq   = g(_safe_get(bal, ["Stockholders Equity", "Total Equity Gross Minority Interest",
-                                   "Common Stock Equity"]), 0.0)
-
-    cash_val  = g(_safe_get(bal, ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments",
-                                   "Cash And Short Term Investments"]), 0.0)
-
-    tot_assets = g(_safe_get(bal, ["Total Assets"]), 0.0)
-
-    # ── Cash flows ────────────────────────────────────────────────────────────
-    capex     = abs(g(_safe_get(cf, ["Capital Expenditure", "Purchase Of Property Plant And Equipment",
-                                      "Capital Expenditures"]), 0.0))
-
-    # ΔWorking Capital: change in non-cash working capital
-    dwc = g(_safe_get(cf, ["Change In Working Capital", "Changes In Working Capital",
-                             "Change In Other Working Capital"]), 0.0)
-
-    # ── Market data ───────────────────────────────────────────────────────────
-    mktcap    = g(info.get("marketCap"), 0.0, "Market Cap")
-    beta      = info.get("beta") or 1.0
-    price_val = info.get("currentPrice") or info.get("regularMarketPrice") or 0.0
-    shares_n  = g(info.get("sharesOutstanding"), 1.0)
-    eps_val   = info.get("trailingEps") or (ni / shares_n if shares_n > 0 else 0)
-
-    # ── Historical EPS and revenue series ─────────────────────────────────────
-    hist_eps = []
-    hist_rev = []
-    if fin is not None and not fin.empty:
-        try:
-            for col_i in range(min(8, len(fin.columns))):
-                ni_h = _safe_get(fin, ["Net Income", "Net Income Common Stockholders"], col_i)
-                rv_h = _safe_get(fin, ["Total Revenue", "Revenue"], col_i)
-                sh_h = info.get("sharesOutstanding", 1)
-                if ni_h and sh_h:
-                    hist_eps.append(float(ni_h) / float(sh_h))
-                if rv_h:
-                    hist_rev.append(float(rv_h) / 1e6)
-            hist_eps = list(reversed(hist_eps))  # oldest first
-            hist_rev = list(reversed(hist_rev))
-        except Exception:
-            pass
-
-    # ── FCFF ──────────────────────────────────────────────────────────────────
-    net_capex = capex - da
-    fcff_val  = ebit * (1 - 0.21) - net_capex - abs(dwc)  # rough, uses US tax rate
-
-    # ── Tax rate ──────────────────────────────────────────────────────────────
-    # Use effective rate from financials if available
-    tax_exp = _safe_get(fin, ["Tax Provision", "Income Tax Expense"])
-    pretax  = _safe_get(fin, ["Pretax Income", "Income Before Tax"])
-    if tax_exp and pretax and pretax > 0:
-        eff_tax = float(tax_exp) / float(pretax)
-        tax_rate = max(0.05, min(0.40, eff_tax))
-    else:
-        tax_rate = info.get("effectiveTaxRate") or 0.21
-
-    source = "live" if not errors else "partial"
-
-    return CompanyData(
-        ticker=ticker.upper(),
-        name=info.get("longName") or info.get("shortName") or ticker,
-        ebit=ebit, interest_expense=interest, net_income=ni,
-        revenue=revenue, ebitda=ebitda, depreciation=da,
-        book_debt=book_debt, book_equity=book_eq,
-        cash=cash_val, total_assets=tot_assets,
-        capex=capex, delta_wc=abs(dwc),
-        equity_market_cap=mktcap,
-        beta_levered=beta, price=price_val,
-        shares=shares_n, eps=eps_val,
-        rf=0.045,               # will be updated by FRED call
-        erp=0.055,              # default US ERP
-        tax_rate=tax_rate,
-        country_spread=0.0,
-        firm_type=1,
-        avg_debt_maturity=5,
-        source=source,
-        fetch_errors=errors,
-        historical_eps=hist_eps,
-        historical_revenue=hist_rev,
-        fcff=fcff_val,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# EDGAR — 10-K supplementary data
-# ─────────────────────────────────────────────────────────────────────────────
-
-EDGAR_BASE = "https://data.sec.gov"
-EDGAR_HEADERS = {"User-Agent": "DamodaranValuationApp research@example.com"}
-
-# CIK lookup cache
 _CIK_CACHE: dict[str, str] = {
     "AAPL": "0000320193", "MSFT": "0000789019", "TSLA": "0001318605",
-    "JPM":  "0000019617", "AMZN": "0001018724", "GOOGL": "0001652044",
-    "META": "0001326801", "NVDA": "0001045810",  "BRK.B": "0001067983",
-    "JNJ":  "0000200406", "V":    "0001403161",  "WMT":   "0000104169",
-    "XOM":  "0000034088", "UNH":  "0000072971",  "PG":    "0000080424",
+    "META": "0001326801", "AMZN": "0001018724", "GOOGL": "0001652044",
+    "NVDA": "0001045810", "JPM":  "0000019617", "V":    "0001403161",
+    "JNJ":  "0000200406", "WMT":  "0000104169", "XOM":  "0000034088",
+    "BRK.B":"0001067983", "UNH":  "0000072971", "PG":   "0000080424",
+    "MA":   "0001141391", "HD":   "0000354950", "ABBV": "0001551152",
+    "CVX":  "0000093410", "MRK":  "0000310158", "LLY":  "0000059478",
+    "ADBE": "0000796343", "CRM":  "0001108524", "ORCL": "0001341439",
+    "NFLX": "0001065280", "INTC": "0000050863", "AMD":  "0000002488",
+    "QCOM": "0000804328", "TXN":  "0000097476", "AVGO": "0001730168",
 }
 
 def _get_cik(ticker: str) -> Optional[str]:
-    """Look up SEC CIK number for a ticker."""
     ticker = ticker.upper()
     if ticker in _CIK_CACHE:
         return _CIK_CACHE[ticker]
     try:
+        # EDGAR company search API
         resp = requests.get(
-            f"{EDGAR_BASE}/cgi-bin/browse-edgar?action=getcompany&ticker={ticker}"
-            f"&type=10-K&dateb=&owner=include&count=1&search_text=&output=atom",
-            headers=EDGAR_HEADERS, timeout=8
+            f"{EDGAR_BASE}/cgi-bin/browse-edgar",
+            params={"action":"getcompany","ticker":ticker,"type":"10-K",
+                    "dateb":"","owner":"include","count":"1","output":"atom"},
+            headers=EDGAR_HEADERS, timeout=10,
         )
-        # Extract CIK from response
         import re
         m = re.search(r'CIK=(\d+)', resp.text)
         if m:
@@ -431,80 +255,167 @@ def _get_cik(ticker: str) -> Optional[str]:
         pass
     return None
 
-
-def fetch_edgar_supplementary(ticker: str) -> dict:
+def _get_xbrl_fact(facts: dict, *concept_names: str, form: str = "10-K",
+                   annual: bool = True) -> Optional[float]:
     """
-    Fetch supplementary financial data from SEC EDGAR.
+    Try multiple XBRL concept names; return most recent annual value.
+    Searches both us-gaap and ifrs-full namespaces.
+    """
+    us_gaap = facts.get("us-gaap", {})
+    ifrs    = facts.get("ifrs-full", {})
 
-    Returns dict with keys:
-      avg_debt_maturity    : weighted average debt maturity (years)
-      operating_lease_commitments : [yr1..yr5, beyond] in $m
-      rd_history           : list of annual R&D spend ($m), most recent first
+    for name in concept_names:
+        for ns in [us_gaap, ifrs]:
+            data = ns.get(name, {})
+            units = data.get("units", {}).get("USD", [])
+            if not units:
+                continue
+            filtered = [x for x in units
+                        if x.get("form") == form and x.get("val") is not None
+                        and (not annual or x.get("fp") in ("FY", None))]
+            if filtered:
+                filtered.sort(key=lambda x: x.get("end", ""), reverse=True)
+                return float(filtered[0]["val"])
+    return None
+
+def _get_xbrl_shares(facts: dict) -> Optional[float]:
+    """Get shares outstanding in millions."""
+    us_gaap = facts.get("us-gaap", {})
+    for name in ["CommonStockSharesOutstanding", "CommonStockSharesIssued",
+                 "EntityCommonStockSharesOutstanding"]:
+        data = us_gaap.get(name, {})
+        units = data.get("units", {}).get("shares", [])
+        if units:
+            units.sort(key=lambda x: x.get("end",""), reverse=True)
+            return float(units[0]["val"]) / 1e6
+    return None
+
+def fetch_from_edgar(ticker: str) -> dict:
+    """
+    Fetch all financial statement data from EDGAR XBRL.
+    Returns raw dict; caller converts to CompanyData.
+    Caches in session_state.
     """
     cache_key = f"edgar_{ticker}"
     if _IN_STREAMLIT and cache_key in st.session_state:
         return st.session_state[cache_key]
 
-    result = {
-        "avg_debt_maturity": 5.0,
-        "operating_lease_commitments": [],
-        "rd_history": [],
-        "source": "edgar",
-        "errors": [],
-    }
+    errors = []
+    result = {"source": "edgar", "errors": errors, "ticker": ticker}
 
     try:
         cik = _get_cik(ticker)
         if not cik:
-            result["errors"].append(f"CIK not found for {ticker}")
+            errors.append(f"CIK not found for {ticker}")
             return result
 
-        # Get company facts (XBRL data — covers most financial line items)
         resp = requests.get(
             f"{EDGAR_BASE}/api/xbrl/companyfacts/CIK{cik}.json",
-            headers=EDGAR_HEADERS, timeout=15,
+            headers=EDGAR_HEADERS, timeout=20,
         )
         resp.raise_for_status()
         facts = resp.json().get("facts", {})
 
-        # R&D expenses — us-gaap ResearchAndDevelopmentExpense
-        us_gaap = facts.get("us-gaap", {})
-        rd_data = us_gaap.get("ResearchAndDevelopmentExpense", {})
-        rd_units = rd_data.get("units", {}).get("USD", [])
-        if rd_units:
-            # Filter to annual (form 10-K), most recent 10 years
-            annual = [x for x in rd_units
-                      if x.get("form") == "10-K" and x.get("val") is not None]
-            annual.sort(key=lambda x: x.get("end", ""), reverse=True)
-            result["rd_history"] = [float(x["val"]) / 1e6 for x in annual[:10]]
+        g = lambda *names: _get_xbrl_fact(facts, *names)
 
-        # Operating lease commitments — OperatingLeasesFutureMinimumPaymentsDue*
-        lease_keys = {
-            1: "OperatingLeasesFutureMinimumPaymentsDueInTwoYears",
-            # Year 1 in various standards
-        }
-        # Try IFRS16 / ASC842 keys
-        for yr, key in [
-            (1, "LesseeOperatingLeaseLiabilityPaymentsDueNextTwelveMonths"),
-            (2, "LesseeOperatingLeaseLiabilityPaymentsDueYearTwo"),
-            (3, "LesseeOperatingLeaseLiabilityPaymentsDueYearThree"),
-            (4, "LesseeOperatingLeaseLiabilityPaymentsDueYearFour"),
-            (5, "LesseeOperatingLeaseLiabilityPaymentsDueYearFive"),
-        ]:
-            data = us_gaap.get(key, {})
-            units = data.get("units", {}).get("USD", [])
-            annual = [x for x in units if x.get("form") == "10-K"]
-            if annual:
-                annual.sort(key=lambda x: x.get("end", ""), reverse=True)
-                val = float(annual[0]["val"]) / 1e6
-                commitments = result["operating_lease_commitments"]
-                while len(commitments) < yr - 1:
-                    commitments.append(0.0)
-                if len(commitments) < yr:
-                    commitments.append(val)
+        # Company name
+        result["name"] = ticker
+
+        # ── Income statement ─────────────────────────────────────────────────
+        result["ebit"] = g(
+            "OperatingIncomeLoss",
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxes",
+        )
+        result["interest_expense"] = abs(g(
+            "InterestExpense",
+            "InterestAndDebtExpense",
+            "FinanceCosts",
+        ) or 0)
+        result["net_income"] = g(
+            "NetIncomeLoss",
+            "NetIncomeLossAvailableToCommonStockholdersBasic",
+            "ProfitLoss",
+        )
+        result["revenue"] = g(
+            "Revenues",
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "SalesRevenueNet",
+            "RevenueFromContractWithCustomerIncludingAssessedTax",
+        )
+        result["depreciation"] = g(
+            "DepreciationDepletionAndAmortization",
+            "DepreciationAndAmortization",
+            "Depreciation",
+        )
+        result["capex"] = abs(g(
+            "PaymentsToAcquirePropertyPlantAndEquipment",
+            "PurchaseOfPropertyPlantAndEquipment",
+            "CapitalExpendituresPurchaseOfPropertyPlantAndEquipment",
+        ) or 0)
+        result["delta_wc"] = abs(g(
+            "IncreaseDecreaseInOperatingCapital",
+            "IncreaseDecreaseInOtherOperatingLiabilities",
+            "ChangeInOperatingAssets",
+        ) or 0)
+
+        # Derived: EBITDA
+        if result.get("ebit") and result.get("depreciation"):
+            result["ebitda"] = result["ebit"] + result["depreciation"]
+
+        # Tax rate
+        tax_exp  = g("IncomeTaxExpenseBenefit", "CurrentIncomeTaxExpense")
+        pre_tax  = g("IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+                     "IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic")
+        if tax_exp and pre_tax and pre_tax > 0:
+            result["tax_rate"] = max(0.05, min(0.40, tax_exp / pre_tax))
+
+        # ── Balance sheet ────────────────────────────────────────────────────
+        result["book_debt"] = (
+            (g("LongTermDebt", "LongTermDebtNoncurrent") or 0) +
+            (g("ShortTermBorrowings", "NotesPayableCurrent",
+               "DebtCurrent") or 0)
+        ) or g("LongTermDebtAndCapitalLeaseObligations") or 0
+
+        result["book_equity"] = g(
+            "StockholdersEquity",
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+            "CommonStockholdersEquity",
+        )
+        result["cash"] = g(
+            "CashAndCashEquivalentsAtCarryingValue",
+            "CashCashEquivalentsAndShortTermInvestments",
+            "CashAndCashEquivalents",
+        )
+        result["total_assets"] = g("Assets")
+
+        # Shares outstanding (in millions)
+        result["shares"] = _get_xbrl_shares(facts)
+
+        # EPS
+        result["eps"] = g(
+            "EarningsPerShareBasic",
+            "EarningsPerShareDiluted",
+        )
+
+        # Historical series (last 5 annual EPS and Revenue for growth module)
+        eps_data = (facts.get("us-gaap",{})
+                    .get("EarningsPerShareBasic",{})
+                    .get("units",{}).get("USD/shares",[]))
+        annual_eps = [x for x in eps_data if x.get("form")=="10-K" and x.get("val")]
+        annual_eps.sort(key=lambda x: x.get("end",""))
+        result["historical_eps"] = [float(x["val"]) for x in annual_eps[-8:]]
+
+        rev_data = None
+        for rev_name in ["Revenues","RevenueFromContractWithCustomerExcludingAssessedTax","SalesRevenueNet"]:
+            rv = facts.get("us-gaap",{}).get(rev_name,{}).get("units",{}).get("USD",[])
+            if rv: rev_data = rv; break
+        if rev_data:
+            annual_rev = [x for x in rev_data if x.get("form")=="10-K" and x.get("val")]
+            annual_rev.sort(key=lambda x: x.get("end",""))
+            result["historical_revenue"] = [float(x["val"])/1e6 for x in annual_rev[-8:]]
 
     except Exception as e:
-        result["errors"].append(str(e))
+        errors.append(f"EDGAR fetch failed: {e}")
 
     if _IN_STREAMLIT:
         st.session_state[cache_key] = result
@@ -512,159 +423,249 @@ def fetch_edgar_supplementary(ticker: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FRED — risk-free rate
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_risk_free_rate(fred_api_key: str = "") -> float:
+    """10-yr Treasury from FRED. Cached per session. Falls back to 4.5%."""
+    if _IN_STREAMLIT and "fred_rf" in st.session_state:
+        return st.session_state["fred_rf"]
+    try:
+        params = {"series_id":"DGS10","api_key":fred_api_key or "FRED_KEY_HERE",
+                  "file_type":"json","sort_order":"desc","limit":5}
+        resp = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                            params=params, timeout=8)
+        resp.raise_for_status()
+        for o in resp.json()["observations"]:
+            if o["value"] not in (".", ""):
+                rf = float(o["value"]) / 100
+                if _IN_STREAMLIT:
+                    st.session_state["fred_rf"] = rf
+                return rf
+    except Exception:
+        pass
+    return 0.045
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# yfinance — price, market cap, beta ONLY (3 fields, with retry)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_market_data_yf(ticker: str, retries: int = 2) -> dict:
+    """
+    Fetch only the 3 market data fields from yfinance.
+    Retries once after 3-second wait if rate-limited.
+    Returns dict with price, market_cap, beta (all may be None on failure).
+    """
+    cache_key = f"yf_market_{ticker}"
+    if _IN_STREAMLIT and cache_key in st.session_state:
+        return st.session_state[cache_key]
+
+    result = {"price": None, "market_cap": None, "beta": None, "name": None, "error": None}
+
+    for attempt in range(retries + 1):
+        try:
+            import yfinance as yf
+            info = yf.Ticker(ticker).info or {}
+            result["price"]      = info.get("currentPrice") or info.get("regularMarketPrice")
+            result["market_cap"] = info.get("marketCap")
+            result["beta"]       = info.get("beta")
+            result["name"]       = info.get("longName") or info.get("shortName")
+            if _IN_STREAMLIT:
+                st.session_state[cache_key] = result
+            return result
+        except Exception as e:
+            err = str(e)
+            if "Too Many Requests" in err or "Rate" in err:
+                if attempt < retries:
+                    time.sleep(3)
+                    continue
+            result["error"] = err
+            break
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_company_data(
-    ticker: str,
-    fred_api_key: str = "",
-    include_edgar: bool = True,
+def get_company_data(
+    ticker:          str,
+    fred_api_key:    str   = "",
+    force_refresh:   bool  = False,
+    # Manual overrides (used when yfinance is unavailable)
+    manual_price:    float = 0.0,
+    manual_mktcap:   float = 0.0,
+    manual_beta:     float = 0.0,
+    industry:        Optional[str] = None,
 ) -> CompanyData:
     """
-    Fetch all data for a ticker. Entry point for all Streamlit pages.
-
-    Strategy:
-      1. Fetch from yfinance (primary)
-      2. Fetch rf from FRED
-      3. Fetch supplementary from EDGAR (debt maturity, leases, R&D)
-      4. Fall back gracefully to placeholders for any missing field
+    Fetch company data. EDGAR primary, yfinance for market data only.
 
     Parameters
     ----------
-    ticker        : Stock ticker (e.g. "AAPL")
-    fred_api_key  : FRED API key (optional; falls back to default rf if missing)
-    include_edgar : Whether to also call EDGAR (slower; set False for quick loads)
-
-    Returns
-    -------
-    CompanyData with source="live", "partial", or "placeholder"
+    ticker         : Stock ticker
+    fred_api_key   : FRED API key for risk-free rate
+    force_refresh  : Bypass session cache
+    manual_price   : Override for stock price (if yfinance unavailable)
+    manual_mktcap  : Override for market cap ($m)
+    manual_beta    : Override for beta (if yfinance unavailable)
+    industry       : Industry name for Damodaran beta fallback
     """
     ticker = ticker.upper().strip()
-
-    # Try yfinance
-    try:
-        raw = _fetch_yfinance(ticker)
-        if "error" in raw:
-            raise ValueError(raw["error"])
-        data = _parse_yfinance(ticker, raw)
-    except Exception as e:
-        # Fall back to placeholder
-        data = _make_placeholder(ticker)
-        data.source = "placeholder"
-        data.fetch_errors.append(f"yfinance failed: {e}")
-        return data
-
-    # Update rf from FRED
-    try:
-        data.rf = get_risk_free_rate(fred_api_key)
-    except Exception as e:
-        data.fetch_errors.append(f"FRED failed, using rf=4.5%: {e}")
-
-    # EDGAR supplementary
-    if include_edgar:
-        try:
-            edgar = fetch_edgar_supplementary(ticker)
-            if edgar.get("rd_history"):
-                data.historical_eps  # keep as-is
-            if edgar.get("avg_debt_maturity"):
-                data.avg_debt_maturity = edgar["avg_debt_maturity"]
-        except Exception as e:
-            data.fetch_errors.append(f"EDGAR partial: {e}")
-
-    # Recalculate FCFF with actual tax rate
-    net_capex = data.capex - data.depreciation
-    data.fcff  = data.ebit * (1 - data.tax_rate) - net_capex - data.delta_wc
-
-    return data
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Streamlit cache wrapper (call this from pages, not fetch_company_data directly)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_company_data(
-    ticker: str,
-    fred_api_key: str = "",
-    force_refresh: bool = False,
-) -> CompanyData:
-    """
-    Cached wrapper for use in Streamlit pages.
-
-    Checks st.session_state first. Only calls the live APIs if the
-    data is not cached or force_refresh=True.
-
-    Usage in a Streamlit page:
-        if st.button("Fetch data"):
-            data = get_company_data(ticker)
-            st.session_state["company_data"] = data
-
-        data = st.session_state.get("company_data") or get_company_data(ticker)
-    """
     cache_key = f"company_{ticker}"
 
-    if not force_refresh and _IN_STREAMLIT:
-        if cache_key in st.session_state:
-            return st.session_state[cache_key]
+    if not force_refresh and _IN_STREAMLIT and cache_key in st.session_state:
+        return st.session_state[cache_key]
 
-    data = fetch_company_data(ticker, fred_api_key)
+    errors: list[str] = []
+
+    # ── Step 1: EDGAR ─────────────────────────────────────────────────────────
+    edgar = fetch_from_edgar(ticker)
+    errors.extend(edgar.get("errors", []))
+
+    # ── Step 2: FRED ──────────────────────────────────────────────────────────
+    rf = get_risk_free_rate(fred_api_key)
+
+    # ── Step 3: yfinance (market data only) ───────────────────────────────────
+    yf_data = _fetch_market_data_yf(ticker)
+    if yf_data.get("error"):
+        errors.append(f"yfinance: {yf_data['error']}")
+
+    # ── Step 4: Resolve each field ────────────────────────────────────────────
+    def _edgar(key, fallback=0.0):
+        v = edgar.get(key)
+        return float(v) / 1e6 if v is not None and abs(v) > 1e4 else (float(v) if v is not None else fallback)
+
+    # Financial statement fields — from EDGAR
+    ebit         = _edgar("ebit")
+    interest     = _edgar("interest_expense")
+    net_income   = _edgar("net_income")
+    revenue      = _edgar("revenue")
+    ebitda_v     = _edgar("ebitda") or (ebit + _edgar("depreciation"))
+    depreciation = _edgar("depreciation")
+    book_debt    = _edgar("book_debt")
+    book_equity  = _edgar("book_equity")
+    cash_v       = _edgar("cash")
+    total_assets = _edgar("total_assets")
+    capex        = _edgar("capex")
+    delta_wc     = _edgar("delta_wc")
+    tax_rate     = edgar.get("tax_rate") or 0.21
+    shares_m     = _edgar("shares") or 1000.0   # already in millions from EDGAR
+
+    # EPS from EDGAR
+    eps_raw = edgar.get("eps")
+    eps_v   = float(eps_raw) if eps_raw else (net_income / shares_m if shares_m > 0 else 0)
+
+    # Historical series from EDGAR
+    hist_eps = edgar.get("historical_eps", [])
+    hist_rev = edgar.get("historical_revenue", [])
+
+    # Market data — prefer manual override, then yfinance, then derived/fallback
+    price_v  = manual_price  or yf_data.get("price")  or 0.0
+    mktcap_v = manual_mktcap or (yf_data.get("market_cap", 0) or 0) / 1e6
+    if mktcap_v == 0 and price_v > 0 and shares_m > 0:
+        mktcap_v = price_v * shares_m   # derive from price × shares
+
+    # Beta — priority: manual → yfinance → Damodaran industry → total market
+    beta_src = "yfinance"
+    beta_v   = manual_beta or yf_data.get("beta") or 0.0
+    if beta_v == 0:
+        if industry and industry in INDUSTRY_BETAS:
+            beta_v   = INDUSTRY_BETAS[industry]["levered"]
+            beta_src = f"Damodaran ({industry})"
+            errors.append(f"Beta from Damodaran industry avg ({industry}): {beta_v:.3f}")
+        else:
+            beta_v   = INDUSTRY_BETAS["Total Market"]["levered"]
+            beta_src = "Damodaran (Total Market avg)"
+            errors.append(f"Beta: yfinance unavailable, using total market avg {beta_v:.3f}")
+    elif manual_beta:
+        beta_src = "manual"
+
+    # Company name — yfinance has better names than EDGAR
+    name_v = yf_data.get("name") or ticker
+
+    # Source classification
+    if edgar.get("errors") and yf_data.get("error"):
+        source = "placeholder"
+    elif edgar.get("errors"):
+        source = "partial (yfinance only)"
+    elif yf_data.get("error") or (not manual_price and not yf_data.get("price")):
+        source = "partial (EDGAR + manual market data)"
+    else:
+        source = "live"
+
+    # FCFF
+    net_capex = capex - depreciation
+    fcff_v = ebit * (1 - tax_rate) - net_capex - delta_wc
+
+    d = CompanyData(
+        ticker=ticker, name=name_v,
+        ebit=ebit, interest_expense=interest, net_income=net_income,
+        revenue=revenue, ebitda=ebitda_v, depreciation=depreciation,
+        book_debt=book_debt, book_equity=book_equity, cash=cash_v,
+        total_assets=total_assets, capex=capex, delta_wc=delta_wc,
+        equity_market_cap=mktcap_v, beta_levered=beta_v,
+        price=price_v, shares=shares_m, eps=eps_v,
+        rf=rf, erp=0.055,
+        tax_rate=tax_rate, country_spread=0.0,
+        firm_type=1, avg_debt_maturity=5,
+        source=source, fetch_errors=errors,
+        historical_eps=hist_eps, historical_revenue=hist_rev,
+        fcff=fcff_v, beta_source=beta_src, industry=industry,
+    )
 
     if _IN_STREAMLIT:
-        st.session_state[cache_key] = data
-
-    return data
+        st.session_state[cache_key] = d
+    return d
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Source badge helper (used by all pages)
+# Source badge
 # ─────────────────────────────────────────────────────────────────────────────
 
-def source_badge_html(data: CompanyData) -> str:
-    """Return HTML badge indicating data source and any errors."""
-    if data.source == "live":
-        colour, icon, label = "#14532d", "✓", "Live data"
-    elif data.source == "partial":
-        colour, icon, label = "#1e3a5f", "~", "Partial live data"
-    else:
-        colour, icon, label = "#3b2a0f", "⚠", "Placeholder data"
-
+def source_badge_html(d: CompanyData) -> str:
+    colours = {
+        "live":                       ("#14532d", "✓", "Live"),
+        "partial (EDGAR + manual market data)": ("#1e3a5f", "~", "EDGAR + manual"),
+        "partial (yfinance only)":    ("#1e3a5f", "~", "Partial"),
+        "placeholder":                ("#3b2a0f", "⚠", "Placeholder"),
+    }
+    colour, icon, label = colours.get(d.source, ("#3b2a0f", "⚠", d.source))
     badge = (f'<span style="font-size:0.72rem;padding:2px 10px;border-radius:4px;'
-             f'background:{colour};color:#fff;display:inline-block">'
-             f'{icon} {label}</span>')
-
-    if data.fetch_errors:
-        errs = "; ".join(data.fetch_errors[:2])
-        badge += (f' <span style="font-size:0.70rem;color:#94a3b8;margin-left:8px">'
-                  f'{errs}</span>')
-    return badge
+             f'background:{colour};color:#fff">{icon} {label}</span>')
+    beta_note = f' <span style="font-size:0.70rem;color:#94a3b8">β from {d.beta_source}</span>' if "damodaran" in d.beta_source.lower() or "manual" in d.beta_source.lower() else ""
+    if d.fetch_errors:
+        err = "; ".join(d.fetch_errors[:2])
+        badge += f' <span style="font-size:0.70rem;color:#94a3b8">{err[:60]}</span>'
+    return badge + beta_note
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Smoke test (runs locally, not in Streamlit context)
+# Smoke test
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("── Placeholder fallback test ────────────────────────")
-    d = _make_placeholder("AAPL")
-    print(f"  {d.ticker}: EBIT ${d.ebit:,.0f}m, MktCap ${d.equity_market_cap:,.0f}m, source={d.source}")
+    print("── Industry beta lookup ─────────────────────────────")
+    for ind in ["Software (System & Application)", "Semiconductor", "Total Market"]:
+        b = INDUSTRY_BETAS[ind]
+        print(f"  {ind:<40} β_levered={b['levered']:.4f}  β_unlevered={b['unlevered']:.4f}")
 
-    print("\n── Source badge ─────────────────────────────────────")
-    print(f"  {source_badge_html(d)}")
+    print("\n── Placeholder fallback ─────────────────────────────")
+    d = _make_placeholder("META")
+    print(f"  {d.ticker}: EBIT ${d.ebit:,.0f}m  Beta {d.beta_levered}  source={d.source}")
 
-    print("\n── Live fetch test (requires network) ───────────────")
+    print("\n── EDGAR fetch (requires network) ───────────────────")
     try:
-        raw = _fetch_yfinance("AAPL")
-        if "error" in raw:
-            print(f"  Network blocked (expected in dev): {raw['error']}")
+        edgar = fetch_from_edgar("AAPL")
+        if edgar.get("errors"):
+            print(f"  Errors: {edgar['errors']}")
         else:
-            d_live = _parse_yfinance("AAPL", raw)
-            print(f"  {d_live.ticker}: {d_live.name}")
-            print(f"  EBIT: ${d_live.ebit:,.0f}m")
-            print(f"  Revenue: ${d_live.revenue:,.0f}m")
-            print(f"  Market cap: ${d_live.equity_market_cap:,.0f}m")
-            print(f"  Beta: {d_live.beta_levered:.2f}")
-            print(f"  Source: {d_live.source}")
-            print(f"  Errors: {d_live.fetch_errors}")
+            ebit = (edgar.get("ebit") or 0) / 1e6
+            rev  = (edgar.get("revenue") or 0) / 1e6
+            print(f"  AAPL EBIT: ${ebit:,.0f}m  Revenue: ${rev:,.0f}m")
     except Exception as e:
-        print(f"  Failed (network): {e}")
+        print(f"  Network blocked (expected in dev): {e}")
 
     print("\n✓ data_fetcher.py structure OK")
