@@ -260,20 +260,21 @@ def _get_cik(ticker: str) -> Optional[str]:
 def _get_xbrl_fact(facts: dict, *concept_names: str, form: str = "10-K",
                    annual: bool = True) -> Optional[float]:
     """
-    Try multiple XBRL concept names; return most recent full-year value.
+    Return the most recent full-year value for any of the given XBRL concepts.
 
-    Strategy (in priority order):
-    1. 10-K filing with fp="FY" — the most reliable annual figure.
-    2. If no 10-K/FY found, sum the four most recent distinct quarterly
-       values (10-Q with fp in Q1/Q2/Q3/Q4) to construct a trailing
-       twelve-month figure.  This is the fallback for companies that
-       file under a different schema or have delayed 10-K availability.
+    Strategy (priority order):
+    1. 10-K with fp="FY" — most reliable; prefer if available and more recent
+       than the four-quarter sum.
+    2. Sum of four most recent non-overlapping quarterly periods, each covering
+       exactly ~3 months (start→end span 80–100 days). This is the TTM fallback
+       for companies without a recent 10-K/FY record in EDGAR.
 
-    The fp="FY" filter is the critical guard against the quarterly-
-    revenue bug: EDGAR stores every historical filing, so without this
-    filter the most-recently-indexed record may be a 10-Q quarter worth
-    ~25% of the annual figure.
+    The 80–100 day span filter is the key guard: it ensures we sum four genuine
+    single quarters rather than any multi-quarter cumulative fact (e.g. a 9-month
+    YTD value with fp=Q3 would span ~270 days and is excluded).
     """
+    from datetime import datetime as _dt
+
     us_gaap = facts.get("us-gaap", {})
     ifrs    = facts.get("ifrs-full", {})
 
@@ -284,31 +285,57 @@ def _get_xbrl_fact(facts: dict, *concept_names: str, form: str = "10-K",
             if not units:
                 continue
 
-            # ── Priority 1: annual 10-K with fp=FY ───────────────────────────
+            # ── Priority 1: 10-K with fp=FY ──────────────────────────────────
             fy = [x for x in units
                   if x.get("form") == "10-K"
                   and x.get("fp")   == "FY"
                   and x.get("val")  is not None]
+            fy_val  = None
+            fy_end  = ""
             if fy:
                 fy.sort(key=lambda x: x.get("end", ""), reverse=True)
-                return float(fy[0]["val"])
+                fy_val = float(fy[0]["val"])
+                fy_end = fy[0].get("end", "")
 
-            # ── Priority 2: sum four most recent distinct quarters (TTM) ─────
-            quarters = [x for x in units
-                        if x.get("form") == "10-Q"
-                        and x.get("fp") in ("Q1", "Q2", "Q3", "Q4")
-                        and x.get("val") is not None]
-            if len(quarters) >= 4:
-                # De-duplicate by end date, keep most recent per end date
-                by_end: dict[str, float] = {}
-                for q in quarters:
-                    end = q.get("end", "")
-                    if end not in by_end:
-                        by_end[end] = float(q["val"])
-                sorted_ends = sorted(by_end.keys(), reverse=True)
+            # ── Priority 2: sum four non-overlapping single quarters (TTM) ───
+            # Filter to records that have both start and end dates and span 80–100 days
+            q_candidates = []
+            for x in units:
+                if x.get("val") is None:
+                    continue
+                start_s = x.get("start", "")
+                end_s   = x.get("end",   "")
+                if not (start_s and end_s):
+                    continue
+                try:
+                    start_d = _dt.strptime(start_s, "%Y-%m-%d")
+                    end_d   = _dt.strptime(end_s,   "%Y-%m-%d")
+                    span    = (end_d - start_d).days
+                    if 80 <= span <= 100:
+                        q_candidates.append((end_s, float(x["val"])))
+                except ValueError:
+                    continue
+
+            ttm_val  = None
+            ttm_end  = ""
+            if len(q_candidates) >= 4:
+                # De-duplicate by end date (keep first occurrence per date)
+                seen: dict[str, float] = {}
+                for end_s, val in sorted(q_candidates, key=lambda x: x[0], reverse=True):
+                    if end_s not in seen:
+                        seen[end_s] = val
+                sorted_ends = sorted(seen.keys(), reverse=True)
                 if len(sorted_ends) >= 4:
-                    ttm = sum(by_end[e] for e in sorted_ends[:4])
-                    return ttm
+                    ttm_val = sum(seen[e] for e in sorted_ends[:4])
+                    ttm_end = sorted_ends[0]  # most recent quarter end
+
+            # Return whichever is more recent: 10-K/FY or TTM
+            if fy_val is not None and ttm_val is not None:
+                return fy_val if fy_end >= ttm_end else ttm_val
+            if fy_val is not None:
+                return fy_val
+            if ttm_val is not None:
+                return ttm_val
 
     return None
 
@@ -477,16 +504,23 @@ def fetch_from_edgar(ticker: str) -> dict:
             result["tax_rate"] = max(0.05, min(0.40, tax_exp / pre_tax))
 
         # ── Balance sheet ────────────────────────────────────────────────────
-        # Financial debt only: LongTermDebt + DebtCurrent.
-        # Explicitly exclude OperatingLeaseLiability, FinanceLeaseLiabilityNoncurrent,
-        # and FinanceLeaseLiabilityCurrent — these are not financial debt and their
-        # inclusion inflates the WACC debt weight and distorts the capital structure module.
-        long_term_debt = g("LongTermDebt", "LongTermDebtNoncurrent") or 0
-        short_term_debt = g("DebtCurrent", "ShortTermBorrowings", "NotesPayableCurrent") or 0
+        # Financial debt ONLY: LongTermDebt + the larger of DebtCurrent or
+        # ShortTermBorrowings (to avoid double-counting if they overlap).
+        # Explicitly excluded: OperatingLeaseLiability,
+        # OperatingLeaseLiabilityNoncurrent, OperatingLeaseLiabilityCurrent,
+        # FinanceLeaseLiabilityNoncurrent, FinanceLeaseLiabilityCurrent.
+        # These are balance-sheet liabilities under ASC 842 but are NOT
+        # interest-bearing financial debt and must not enter the WACC or
+        # capital structure calculations.
+        long_term_debt  = g("LongTermDebt", "LongTermDebtNoncurrent") or 0
+        debt_current    = g("DebtCurrent") or 0
+        stb             = g("ShortTermBorrowings") or 0
+        short_term_debt = max(debt_current, stb)   # take larger; they often overlap
         result["book_debt"] = long_term_debt + short_term_debt
-        # Fallback only if both components return zero (very rare)
+        # Fallback: zero-debt companies that file no individual debt lines
         if result["book_debt"] == 0:
-            result["book_debt"] = g("LongTermDebtAndCapitalLeaseObligations") or 0
+            notes = g("NotesPayable", "NotesPayableCurrent") or 0
+            result["book_debt"] = notes
 
         result["book_equity"] = g(
             "StockholdersEquity",
