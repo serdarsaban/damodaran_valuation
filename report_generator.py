@@ -880,7 +880,7 @@ def _render_audit(d, g_use=0, wacc_v=0, a=None):
         ["Market cap",           _usd(d.equity_market_cap,0),   "yfinance info"],
         ["Beta (levered)",       f"{d.beta_levered:.3f}",        f"Source: {d.beta_source}"],
         ["Stock price",          f"${d.price:.2f}" if d.price else "N/A", "yfinance / manual"],
-        ["Shares outstanding",   f"{d.shares:,.0f}m",           "EDGAR: CommonStockSharesOutstanding"],
+        ["Shares outstanding",   f"{d.shares:,.0f}m",           "EDGAR: WeightedAverageNumberOfDilutedSharesOutstanding"],
         ["EPS (trailing)",       f"${d.eps:.2f}" if d.eps else "N/A", "EDGAR: EarningsPerShareBasic"],
         ["Risk-free rate",       _pct(d.rf),                    "FRED DGS10"],
         ["Equity risk premium",  _pct(d.erp),                   "Damodaran (Jan 2026)"],
@@ -939,13 +939,17 @@ def generate_report(d: CompanyData, a: Optional[ReportAssumptions] = None) -> st
     # Module 02
     fcff_result = None
     try:
-        wc_pct = d.delta_wc/d.revenue if d.revenue > 0 else 0.02
+        wc_pct   = d.delta_wc/d.revenue if d.revenue > 0 else 0.02
+        # Fix 2: use market value of debt (from Module 01) not book debt.
+        # This ensures r.value_per_share and the value bridge box agree exactly.
+        # Per Damodaran Ch 15 p.375: equity = firm_value - MV(debt) + cash.
+        mv_debt_for_fcff = coc.market_debt if coc and coc.market_debt > 0 else d.book_debt
         fcff_result = fcff_2stage(
             ebit=d.ebit, tax_rate=d.tax_rate, capex=d.capex, depreciation=d.depreciation,
             delta_wc=d.delta_wc, revenues=d.revenue,
             wacc_high=wacc_v, g_high=g_use, n_high=a.n_high,
             g_stable=a.g_stable, wacc_stable=wacc_v*0.95, stable_roc=a.stable_roc,
-            wc_pct_rev=wc_pct, debt_mv=d.book_debt, cash=d.cash, shares=d.shares)
+            wc_pct_rev=wc_pct, debt_mv=mv_debt_for_fcff, cash=d.cash, shares=d.shares)
     except Exception as e: errors.append(f"FCFF: {e}")
 
     # Module 04
