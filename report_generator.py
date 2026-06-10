@@ -451,8 +451,19 @@ def _render_growth(d, g, tv, coc):
 
 # ── Module 02 ─────────────────────────────────────────────────────────────────
 
-def _render_fcff(d, r, price=0):
+def _render_fcff(d, r, price=0, market_debt=None):
     tv_pct = r.pv_terminal_value / r.value_of_firm if r.value_of_firm > 0 else 0
+    # Tax rate anomaly warning
+    tax_warn = ""
+    if d.tax_rate_anomaly and d.tax_rate_prior_year:
+        tax_warn = (_warn(
+            f"Tax rate anomaly detected: effective rate {_pct(d.tax_rate)} deviates more than "
+            f"10pp from prior year {_pct(d.tax_rate_prior_year)}. This often indicates a "
+            f"one-time item (e.g. valuation allowance charge) that inflates the reported rate. "
+            f"Damodaran Ch 10 p.248: use a normalised marginal rate for forward valuation. "
+            f"Consider using the prior-year rate ({_pct(d.tax_rate_prior_year)}) or the "
+            f"statutory rate for NOPAT and FCFF calculations."
+        ))
     g_used = r.inputs.get("g_high", 0)
     g_s    = r.inputs.get("g_stable", 0.03)
     sr     = r.inputs.get("stable_roc", 0.12)
@@ -465,9 +476,10 @@ def _render_fcff(d, r, price=0):
         note=f"High-growth rate: <strong>{g_used:.2%}</strong> (auto from growth module) · "
              f"Stable rate: <strong>{g_s:.2%}</strong> · "
              f"Stable RIR: <strong>{g_s/sr:.1%}</strong> (= g/ROC = {g_s:.2%}/{sr:.2%}) · "
-             f"Stable WACC: <strong>{ws:.2%}</strong>",
+             f"Stable WACC: <strong>{ws:.2%}</strong>" f" (= high-growth WACC × 0.95: reflects lower beta ~0.8–1.0 and less leverage risk in stable phase — adjust this if firm will differ materially at maturity; Ch 12 p.303)",
         src="Damodaran Ch 10 p.247; Ch 15 p.375"
     )
+    if tax_warn: h += tax_warn
 
     h += _metrics(("Value of Firm", _usd(r.value_of_firm)),
                   ("Value of Equity", _usd(r.value_of_equity)),
@@ -478,14 +490,22 @@ def _render_fcff(d, r, price=0):
     s_m,  t_m  = _s_mos(price, r.value_per_share)
     h += _badges((s_tv, t_tv), (s_m, t_m))
 
+    # Use market value of debt in bridge per Damodaran Ch 15 p.375
+    mv_debt_used = market_debt if market_debt and market_debt > 0 else r.debt_mv
+    eq_corrected = r.value_of_firm - mv_debt_used + r.cash
+    vps_corrected = eq_corrected / r.shares if r.shares > 0 else 0
+    mv_note = (f"<br><em style='font-size:0.8rem;color:#94a3b8'>Note: equity bridge uses market value of debt "
+               f"({_usd(mv_debt_used)}) per Ch 15 p.375, not book debt ({_usd(r.debt_mv)})</em>"
+               if abs(mv_debt_used - r.debt_mv) > 500 else "")
     h += _box(
         f"Value bridge:<br>"
         f"PV high-growth FCFFs: <strong>{_usd(r.pv_fcff_highgrowth)}</strong><br>"
         f"PV terminal value: <strong>{_usd(r.pv_terminal_value)}</strong> ({tv_pct:.0%} of firm value)<br>"
         f"= Firm value: <strong>{_usd(r.value_of_firm)}</strong><br>"
-        f"− Debt: {_usd(r.debt_mv)} + Cash: {_usd(r.cash)}<br>"
-        f"= Equity: <strong>{_usd(r.value_of_equity)}</strong> ÷ {r.shares:,.0f}m shares"
-        f" = <strong style='color:#3b82f6;font-size:1.05rem'>${r.value_per_share:.2f}/share</strong>"
+        f"− Market debt: {_usd(mv_debt_used)} + Cash: {_usd(r.cash)}<br>"
+        f"= Equity: <strong>{_usd(eq_corrected)}</strong> ÷ {r.shares:,.0f}m shares"
+        f" = <strong style='color:#3b82f6;font-size:1.05rem'>${vps_corrected:.2f}/share</strong>"
+        f"{mv_note}"
     )
 
     h += _sub("Terminal Value")
@@ -524,6 +544,11 @@ def _render_multiples(d, eq_m, fm, coc, g, payout_high):
         h += _sub("Equity Multiples (2-stage DDM)")
         h += _formula(
             "PE = PV(FCFE stream)/EPS₁    PBV = PE × ROE    PS = PE × net_margin    PEG = PE/(g×100)",
+            note="Note: PBV = PE × ROE and PS = PE × net_margin are algebraic identities — "
+                 "they derive from the same DDM as PE and will produce the same implied price. "
+                 "They are not independent methods; they are one model expressed in three ways "
+                 "(Ch 17–19). Use them to cross-check margin and ROE assumptions, not as "
+                 "independent valuation evidence.",
             src="Damodaran Ch 17–19; eqmult.xls"
         )
         h += f'<div class="card-grid">'
@@ -559,6 +584,10 @@ def _render_multiples(d, eq_m, fm, coc, g, payout_high):
         h += _sub("Firm Multiples (2-stage FCFF)")
         h += _formula(
             "EV/EBIT_fwd = EV/NOPAT × (1−t)    EV/Sales = EV/NOPAT × margin    EV/IC = EV/NOPAT × ROIC",
+            note="Note: EV/Sales and EV/EBIT that imply the same EV are also algebraic transforms of "
+                 "the same FCFF model via margin and tax rate. When they return identical prices, "
+                 "that is expected — they are not independent (Ch 20). Check that the margin "
+                 "assumption in EV/Sales is realistic relative to the EBIT margin.",
             src="Damodaran Ch 20; firmmult.xls"
         )
         h += f'<div class="card-grid">'
@@ -618,10 +647,19 @@ def _render_ocs(d, ocs):
                       f"repurchase {ocs.shares_repurchased:,.0f}m shares. "
                       f"Remaining shares → ${ocs.optimal_price_per_share:.2f}/share." if ocs.optimal_price_per_share > 0
                       else "<br>Repurchase analysis: N/A (optimal price negative — OCS firm value inconsistent with DCF at current growth)")
+    # DCF-consistent value gain: apply WACC delta to DCF firm value if available
+    wacc_delta = ocs.current_wacc - ocs.optimal_wacc
     h += _box(
         f"<strong>Interpretation:</strong> {d.name} is currently <strong>{direction}</strong>. "
         f"Current D/(D+E) = {ocs.current_debt_ratio:.1%} vs optimal {ocs.optimal_debt_ratio:.1%}.<br>"
         f"Recommended action: <strong>{action}</strong>.{repurchase}"
+        f"<br><br><em style='font-size:0.82rem;color:#94a3b8'>"
+        f"⚠ OCS firm value ({_usd(ocs.current_firm_value)}) uses a zero-growth perpetuity "
+        f"(NOPAT/WACC) and will be far smaller than the DCF value for high-growth firms. "
+        f"The WACC reduction ({_pct(ocs.current_wacc)} → {_pct(ocs.optimal_wacc)}, "
+        f"Δ = {wacc_delta*100:.2f}pp) is directionally correct. "
+        f"For a DCF-consistent gain estimate: apply the WACC reduction to the DCF firm value. "
+        f"Textbook ref: Ch 15 p.395</em>"
     )
 
     opt_idx = next((i for i,r in enumerate(ocs.sweep) if abs(r.debt_ratio-ocs.optimal_debt_ratio)<0.001), -1)
@@ -682,8 +720,14 @@ def _render_special(d, coc, fcff_result=None):
 
     # EVA 5-year projection (fixed IC, growing NOPAT — matches page behaviour)
     h += _sub("EVA — 5-Year Projection")
-    h += _box("NOPAT grows at 10% p.a. while IC is held fixed (consistent with pages). "
-              "ROC rises as NOPAT grows relative to fixed capital base.")
+    h += _box(
+        "NOPAT grows at 10% p.a. while IC is held fixed (consistent with page behaviour). "
+        "ROC therefore rises each year — this is a modelling limitation: if NOPAT grows, "
+        "IC should also grow by the retained reinvestment. The Damodaran-correct approach "
+        "(Ch 11 p.280) ties IC growth to the reinvestment rate: ΔIC = NOPAT × RIR. "
+        "This projection overstates short-run value creation but is shown for page consistency. "
+        "The main FCFF DCF (Module 02) handles this correctly via the RIR and net capex."
+    )
     eva_rows = []
     nopat_t = nopat
     for t in range(1, 6):
@@ -747,9 +791,16 @@ def _render_special(d, coc, fcff_result=None):
 
     # ── Financial firm ────────────────────────────────────────────────────────
     h += _sub("3. Financial Firm — Excess Returns Model")
+    is_financial = d.firm_type == 3
+    ff_caveat = ("" if is_financial else
+                 "<br><strong style='color:#fde68a'>⚠ Illustrative only:</strong> "
+                 "This model is designed for banks and insurers (Ch 21) where debt is raw material. "
+                 "Applying it to a non-financial firm overstates equity value because the model "
+                 "ignores the reinvestment required to sustain growth. "
+                 "Do not use this value for non-financial companies.")
     h += _formula(
         "Value = Book_Equity + PV[(ROE − ke) × Book_Equity]",
-        note="For banks/insurers where debt is raw material, not capital",
+        note=f"For banks/insurers where debt is raw material, not capital{ff_caveat}",
         src="Damodaran Ch 21 p.519"
     )
     roe_curr = d.net_income / d.book_equity if d.book_equity > 0 else 0
@@ -943,7 +994,7 @@ def generate_report(d: CompanyData, a: Optional[ReportAssumptions] = None) -> st
     if errors: body += "".join(_warn(f"Module error: {e}") for e in errors)
     if coc:          body += _render_coc(d, coc)
     if g_result:     body += _render_growth(d, g_result, tv_result, coc)
-    if fcff_result:  body += _render_fcff(d, fcff_result, d.price)
+    if fcff_result:  body += _render_fcff(d, fcff_result, d.price, coc.market_debt if coc else None)
     if eq_m or fm:   body += _render_multiples(d, eq_m, fm, coc, g_result, payout_high or 0.5)
     if ocs:          body += _render_ocs(d, ocs)
     if coc:          body += _render_special(d, coc, fcff_result)
