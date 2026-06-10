@@ -417,6 +417,67 @@ def _check_share_consistency(shares_m: float, market_cap_usd: float,
         )
     return None
 
+def _get_xbrl_fact_sourced(facts: dict, *concept_names: str) -> tuple:
+    """
+    Same as _get_xbrl_fact but returns (value, source_label).
+    source_label is "10-K/FY YYYY-MM-DD" or "TTM (4Q to YYYY-MM-DD)".
+    """
+    from datetime import datetime as _dt
+    us_gaap = facts.get("us-gaap", {})
+    ifrs    = facts.get("ifrs-full", {})
+
+    for name in concept_names:
+        for ns in [us_gaap, ifrs]:
+            data  = ns.get(name, {})
+            units = data.get("units", {}).get("USD", [])
+            if not units:
+                continue
+
+            fy = [x for x in units
+                  if x.get("form") == "10-K"
+                  and x.get("fp") == "FY"
+                  and x.get("val") is not None]
+            fy_val, fy_end = None, ""
+            if fy:
+                fy.sort(key=lambda x: x.get("end", ""), reverse=True)
+                fy_val = float(fy[0]["val"])
+                fy_end = fy[0].get("end", "")
+
+            q_candidates = []
+            for x in units:
+                if x.get("val") is None: continue
+                start_s, end_s = x.get("start",""), x.get("end","")
+                if not (start_s and end_s): continue
+                try:
+                    span = (_dt.strptime(end_s,"%Y-%m-%d") - _dt.strptime(start_s,"%Y-%m-%d")).days
+                    if 80 <= span <= 100:
+                        q_candidates.append((end_s, float(x["val"])))
+                except ValueError:
+                    continue
+
+            ttm_val, ttm_end = None, ""
+            if len(q_candidates) >= 4:
+                seen: dict[str, float] = {}
+                for e, v in sorted(q_candidates, key=lambda x: x[0], reverse=True):
+                    if e not in seen: seen[e] = v
+                ends = sorted(seen.keys(), reverse=True)
+                if len(ends) >= 4:
+                    ttm_val = sum(seen[e] for e in ends[:4])
+                    ttm_end = ends[0]
+
+            if fy_val is not None and ttm_val is not None:
+                if fy_end >= ttm_end:
+                    return fy_val, f"10-K/FY {fy_end}"
+                else:
+                    return ttm_val, f"TTM (4Q to {ttm_end})"
+            if fy_val is not None:
+                return fy_val, f"10-K/FY {fy_end}"
+            if ttm_val is not None:
+                return ttm_val, f"TTM (4Q to {ttm_end})"
+
+    return None, "not found"
+
+
 def fetch_from_edgar(ticker: str) -> dict:
     """
     Fetch all financial statement data from EDGAR XBRL.
@@ -428,7 +489,8 @@ def fetch_from_edgar(ticker: str) -> dict:
         return st.session_state[cache_key]
 
     errors = []
-    result = {"source": "edgar", "errors": errors, "ticker": ticker}
+    result = {"source": "edgar", "errors": errors, "ticker": ticker,
+              "data_notes": []}   # ← collects TTM warnings
 
     try:
         cik = _get_cik(ticker)
@@ -445,38 +507,47 @@ def fetch_from_edgar(ticker: str) -> dict:
 
         g = lambda *names: _get_xbrl_fact(facts, *names)
 
+        def gs(label, *names):
+            """Fetch with source tracking; appends TTM note if applicable."""
+            val, src = _get_xbrl_fact_sourced(facts, *names)
+            if val is not None and "TTM" in src:
+                result["data_notes"].append(
+                    f"{label}: {src} — EDGAR 10-K/FY not yet indexed for most recent fiscal year. "
+                    f"Value is trailing twelve months ending {src.split('to ')[-1]}. "
+                    f"Consider overriding with the 10-K annual figure if available."
+                )
+            return val
+
         # Company name
         result["name"] = ticker
 
-        # ── Income statement ─────────────────────────────────────────────────
-        result["ebit"] = g(
+        # ── Income statement (use gs() to track TTM vs 10-K/FY) ─────────────
+        result["ebit"] = gs("EBIT",
             "OperatingIncomeLoss",
             "IncomeLossFromContinuingOperationsBeforeIncomeTaxes",
         )
-        result["interest_expense"] = abs(g(
+        result["interest_expense"] = abs(gs("Interest expense",
             "InterestExpense",
             "InterestAndDebtExpense",
             "FinanceCosts",
         ) or 0)
-        result["net_income"] = g(
+        result["net_income"] = gs("Net income",
             "NetIncomeLoss",
             "NetIncomeLossAvailableToCommonStockholdersBasic",
             "ProfitLoss",
         )
-        result["revenue"] = g(
+        result["revenue"] = gs("Revenue",
             "Revenues",
             "RevenueFromContractWithCustomerExcludingAssessedTax",
             "SalesRevenueNet",
             "RevenueFromContractWithCustomerIncludingAssessedTax",
         )
-        result["depreciation"] = g(
+        result["depreciation"] = gs("Depreciation",
             "DepreciationDepletionAndAmortization",
             "DepreciationAndAmortization",
             "Depreciation",
         )
-        # CapEx: include finance lease principal payments (per Damodaran Ch 9)
-        # Meta's 10-K reports "$72.22bn CapEx including finance lease payments"
-        raw_capex = g(
+        raw_capex = gs("CapEx",
             "PaymentsToAcquirePropertyPlantAndEquipment",
             "PurchaseOfPropertyPlantAndEquipment",
             "CapitalExpendituresPurchaseOfPropertyPlantAndEquipment",
@@ -486,7 +557,7 @@ def fetch_from_edgar(ticker: str) -> dict:
             "RepaymentsOfFinanceLeaseLiability",
         ) or 0
         result["capex"] = abs(raw_capex) + abs(lease_payments)
-        result["delta_wc"] = abs(g(
+        result["delta_wc"] = abs(gs("ΔWC",
             "IncreaseDecreaseInOperatingCapital",
             "IncreaseDecreaseInOtherOperatingLiabilities",
             "ChangeInOperatingAssets",
@@ -673,6 +744,9 @@ def get_company_data(
     # ── Step 1: EDGAR ─────────────────────────────────────────────────────────
     edgar = fetch_from_edgar(ticker)
     errors.extend(edgar.get("errors", []))
+    # Surface TTM staleness notes as warnings in the status bar
+    for note in edgar.get("data_notes", []):
+        errors.append(note)
 
     # ── Step 2: FRED ──────────────────────────────────────────────────────────
     rf = get_risk_free_rate(fred_api_key)
