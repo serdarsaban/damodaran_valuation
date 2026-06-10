@@ -299,6 +299,7 @@ def _get_xbrl_fact(facts: dict, *concept_names: str, form: str = "10-K",
 
             # ── Priority 2: sum four non-overlapping single quarters (TTM) ───
             # Filter to records that have both start and end dates and span 80–100 days
+            # ── Path A: span-based filter (start + end both present) ────────
             q_candidates = []
             for x in units:
                 if x.get("val") is None:
@@ -315,6 +316,46 @@ def _get_xbrl_fact(facts: dict, *concept_names: str, form: str = "10-K",
                         q_candidates.append((end_s, float(x["val"])))
                 except ValueError:
                     continue
+
+            # ── Path B: end-date-gap filter (no start date, e.g. META Revenues) ─
+            # Some filers store quarterly facts with only an end date (no start).
+            # Identify single quarters by checking consecutive end-date gaps ~90 days.
+            # CRITICAL: exclude fp=FY annual records — they share the same end date
+            # as the last quarter and would appear as the "first" entry, causing
+            # the chain to stall because the next gap would be ~90 days into a
+            # different year rather than ~90 days backward within the same year.
+            if len(q_candidates) < 4:
+                end_only = [(x.get("end",""), float(x["val"]))
+                            for x in units
+                            if x.get("val") is not None
+                            and x.get("end","")
+                            and not x.get("start","")
+                            and x.get("form") == "10-Q"   # 10-Q only — exclude 10-K/FY
+                            and x.get("fp") != "FY"]      # exclude annual fp; allow None/Q1/Q2/Q3/Q4
+                if len(end_only) >= 4:
+                    # Sort descending, deduplicate by end date
+                    seen_b: dict[str, float] = {}
+                    for e, v in sorted(end_only, key=lambda x: x[0], reverse=True):
+                        if e not in seen_b:
+                            seen_b[e] = v
+                    ends_b = sorted(seen_b.keys(), reverse=True)
+                    # Check consecutive gaps are 75-105 days (one quarter)
+                    valid_chain = []
+                    for i, e in enumerate(ends_b):
+                        if i == 0:
+                            valid_chain.append(e)
+                        elif valid_chain:
+                            try:
+                                gap = (_dt.strptime(valid_chain[-1], "%Y-%m-%d") -
+                                       _dt.strptime(e, "%Y-%m-%d")).days
+                                if 75 <= gap <= 105:
+                                    valid_chain.append(e)
+                                else:
+                                    break  # gap too large — likely annual or gap in series
+                            except ValueError:
+                                break
+                    if len(valid_chain) >= 4:
+                        q_candidates = [(e, seen_b[e]) for e in valid_chain[:4]]
 
             ttm_val  = None
             ttm_end  = ""
@@ -574,38 +615,87 @@ def fetch_from_edgar(ticker: str) -> dict:
         if tax_exp and pre_tax and pre_tax > 0:
             result["tax_rate"] = max(0.05, min(0.40, tax_exp / pre_tax))
 
-        # ── Balance sheet ────────────────────────────────────────────────────
-        # Financial debt ONLY: LongTermDebt + the larger of DebtCurrent or
-        # ShortTermBorrowings (to avoid double-counting if they overlap).
-        # Explicitly excluded: OperatingLeaseLiability,
-        # OperatingLeaseLiabilityNoncurrent, OperatingLeaseLiabilityCurrent,
-        # FinanceLeaseLiabilityNoncurrent, FinanceLeaseLiabilityCurrent.
-        # These are balance-sheet liabilities under ASC 842 but are NOT
-        # interest-bearing financial debt and must not enter the WACC or
-        # capital structure calculations.
-        long_term_debt  = g("LongTermDebt", "LongTermDebtNoncurrent") or 0
-        debt_current    = g("DebtCurrent") or 0
-        stb             = g("ShortTermBorrowings") or 0
-        short_term_debt = max(debt_current, stb)   # take larger; they often overlap
+        # ── Balance sheet — financial debt only ─────────────────────────────
+        # Priority: LongTermDebtNoncurrent (bonds/notes, excludes finance leases
+        # which are filed separately). Only fall back to the broader LongTermDebt
+        # if Noncurrent returns zero.
+        ltd_noncurrent = g("LongTermDebtNoncurrent") or 0
+        ltd_broad      = g("LongTermDebt") or 0
+
+        if ltd_noncurrent > 0:
+            long_term_debt = ltd_noncurrent
+        else:
+            long_term_debt = ltd_broad
+
+        # Short-term financial debt: DebtCurrent or ShortTermBorrowings.
+        # Cap at long_term_debt × 0.10 — a short-term portion larger than 10%
+        # of long-term almost certainly means lease liabilities are being included
+        # (ASC 842 current lease liabilities are typically 5-15% of total assets
+        # but appear as large values under DebtCurrent for some XBRL filers).
+        debt_current = g("DebtCurrent") or 0
+        stb          = g("ShortTermBorrowings") or 0
+        raw_st       = max(debt_current, stb)
+        cap_st       = long_term_debt * 0.10 if long_term_debt > 0 else raw_st
+        short_term_debt = min(raw_st, cap_st)
+
         result["book_debt"] = long_term_debt + short_term_debt
-        # Fallback: zero-debt companies that file no individual debt lines
+
+        # Final sanity check: book_debt > 40% of total assets → still includes leases
+        tot_assets_check = g("Assets") or 0
+        if tot_assets_check > 0 and result["book_debt"] > tot_assets_check * 0.40:
+            result["book_debt"] = ltd_noncurrent if ltd_noncurrent > 0 else long_term_debt
+            errors.append(
+                f"book_debt capped at LongTermDebtNoncurrent (${result['book_debt']/1e9:.1f}bn): "
+                f"combined value exceeded 40% of total assets — lease liabilities likely included."
+            )
+
+        # Zero-debt fallback
         if result["book_debt"] == 0:
-            notes = g("NotesPayable", "NotesPayableCurrent") or 0
-            result["book_debt"] = notes
+            result["book_debt"] = g("NotesPayable", "NotesPayableCurrent") or 0
 
         result["book_equity"] = g(
             "StockholdersEquity",
             "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
             "CommonStockholdersEquity",
         )
-        result["cash"] = g(
-            # Priority: cash + short-term investments (marketable securities)
-            # Damodaran Ch 16: treat marketable securities as part of cash in the equity bridge
+        # Cash + marketable securities (Damodaran Ch 16: include all near-cash).
+        # META files securities across multiple concepts; try combined first,
+        # then build up from components.
+        cash_combined = g(
             "CashCashEquivalentsAndShortTermInvestments",
             "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
-            "CashAndCashEquivalentsAtCarryingValue",
-            "CashAndCashEquivalents",
         )
+        if cash_combined:
+            result["cash"] = cash_combined
+        else:
+            cash_only = g(
+                "CashAndCashEquivalentsAtCarryingValue",
+                "CashAndCashEquivalents",
+            ) or 0
+            # Marketable securities — try every concept META may use
+            mkt_current = g(
+                "ShortTermInvestments",
+                "MarketableSecuritiesCurrent",
+                "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
+                "DebtSecuritiesAvailableForSaleCurrent",
+            ) or 0
+            mkt_noncurrent = g(
+                "MarketableSecuritiesNoncurrent",
+                "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent",
+                "DebtSecuritiesAvailableForSaleNoncurrent",
+                "LongTermInvestments",
+            ) or 0
+            mkt_total = mkt_current + mkt_noncurrent
+            # Last resort: try the undifferentiated MarketableSecurities tag
+            if mkt_total == 0:
+                mkt_total = g("MarketableSecurities") or 0
+            result["cash"] = cash_only + mkt_total
+            if mkt_total > 0:
+                errors.append(
+                    f"Cash ${cash_only/1e9:.1f}bn + marketable securities "
+                    f"${mkt_total/1e9:.1f}bn = ${result['cash']/1e9:.1f}bn total "
+                    f"(Ch 16: include near-cash in equity bridge)."
+                )
         result["total_assets"] = g("Assets")
 
         # Shares outstanding (in millions)
