@@ -162,13 +162,15 @@ class CompanyData:
     country_spread:     float
     firm_type:          int
     avg_debt_maturity:  float
-    source:             str
-    fetch_errors:       list[str] = field(default_factory=list)
-    historical_eps:     list[float] = field(default_factory=list)
-    historical_revenue: list[float] = field(default_factory=list)
-    fcff:               float = 0.0
-    beta_source:        str = "yfinance"   # "yfinance" | "damodaran" | "manual"
-    industry:           Optional[str] = None
+    source:                str
+    fetch_errors:          list[str] = field(default_factory=list)
+    historical_eps:        list[float] = field(default_factory=list)
+    historical_revenue:    list[float] = field(default_factory=list)
+    fcff:                  float = 0.0
+    beta_source:           str = "yfinance"
+    industry:              Optional[str] = None
+    tax_rate_prior_year:   Optional[float] = None   # for anomaly detection
+    tax_rate_anomaly:      bool = False              # True if rate swung >10pp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -259,7 +261,12 @@ def _get_xbrl_fact(facts: dict, *concept_names: str, form: str = "10-K",
                    annual: bool = True) -> Optional[float]:
     """
     Try multiple XBRL concept names; return most recent annual value.
-    Searches both us-gaap and ifrs-full namespaces.
+
+    Critical: filters to fp="FY" (full year) and form="10-K" only.
+    This prevents pulling quarterly figures (Q1/Q2/Q3/Q4) which EDGAR
+    may return alongside annual data for the same concept.
+    A quarterly revenue figure labelled as the most recent filing will
+    be ~4× smaller than annual, causing EBIT margins above 100%.
     """
     us_gaap = facts.get("us-gaap", {})
     ifrs    = facts.get("ifrs-full", {})
@@ -270,24 +277,61 @@ def _get_xbrl_fact(facts: dict, *concept_names: str, form: str = "10-K",
             units = data.get("units", {}).get("USD", [])
             if not units:
                 continue
+            # Strict annual filter: must be 10-K AND fp=FY
+            # fp=FY means full fiscal year; excludes Q1/Q2/Q3/Q4 quarterly filings
             filtered = [x for x in units
-                        if x.get("form") == form and x.get("val") is not None
-                        and (not annual or x.get("fp") in ("FY", None))]
+                        if x.get("form") == "10-K"
+                        and x.get("val") is not None
+                        and x.get("fp") == "FY"]
             if filtered:
                 filtered.sort(key=lambda x: x.get("end", ""), reverse=True)
                 return float(filtered[0]["val"])
     return None
 
 def _get_xbrl_shares(facts: dict) -> Optional[float]:
-    """Get shares outstanding in millions."""
+    """
+    Get diluted weighted-average shares outstanding in millions.
+
+    Priority:
+    1. Derive from EPS: diluted_shares = NI / EPS_diluted
+       This gives the correct diluted weighted-average count used in EPS reporting,
+       which is what Damodaran uses for per-share equity value.
+    2. Fall back to CommonStockSharesOutstanding (basic, as filed)
+
+    CommonStockSharesOutstanding is the WRONG number to use:
+    it is the raw share count on the balance sheet date, not the diluted
+    weighted-average. For META it returns ~1,000m (Class A only) vs
+    ~2,574m diluted weighted-average. Using it overstates EPS and VPS by ~2.6×.
+    """
     us_gaap = facts.get("us-gaap", {})
-    for name in ["CommonStockSharesOutstanding", "CommonStockSharesIssued",
-                 "EntityCommonStockSharesOutstanding"]:
+
+    # Method 1: derive diluted shares from NI / EPS_diluted (most accurate)
+    ni_data  = us_gaap.get("NetIncomeLoss", {}).get("units", {}).get("USD", [])
+    eps_data = us_gaap.get("EarningsPerShareDiluted", {}).get("units", {}).get("USD/shares", [])
+
+    ni_annual  = [x for x in ni_data  if x.get("form")=="10-K" and x.get("fp")=="FY"]
+    eps_annual = [x for x in eps_data if x.get("form")=="10-K" and x.get("fp")=="FY"]
+
+    if ni_annual and eps_annual:
+        ni_annual.sort(key=lambda x: x.get("end",""),  reverse=True)
+        eps_annual.sort(key=lambda x: x.get("end",""), reverse=True)
+        ni_val  = float(ni_annual[0]["val"])
+        eps_val = float(eps_annual[0]["val"])
+        if eps_val != 0 and abs(eps_val) > 0.01:
+            diluted_shares_m = ni_val / eps_val / 1e6
+            # Sanity check: must be between 10m and 500bn shares
+            if 10 < diluted_shares_m < 500_000:
+                return diluted_shares_m
+
+    # Method 2: fall back to basic shares (less accurate but available)
+    for name in ["CommonStockSharesOutstanding", "EntityCommonStockSharesOutstanding"]:
         data = us_gaap.get(name, {})
         units = data.get("units", {}).get("shares", [])
-        if units:
-            units.sort(key=lambda x: x.get("end",""), reverse=True)
-            return float(units[0]["val"]) / 1e6
+        annual = [x for x in units if x.get("form")=="10-K"]
+        if annual:
+            annual.sort(key=lambda x: x.get("end",""), reverse=True)
+            return float(annual[0]["val"]) / 1e6
+
     return None
 
 def fetch_from_edgar(ticker: str) -> dict:
@@ -347,11 +391,18 @@ def fetch_from_edgar(ticker: str) -> dict:
             "DepreciationAndAmortization",
             "Depreciation",
         )
-        result["capex"] = abs(g(
+        # CapEx: include finance lease principal payments (per Damodaran Ch 9)
+        # Meta's 10-K reports "$72.22bn CapEx including finance lease payments"
+        raw_capex = g(
             "PaymentsToAcquirePropertyPlantAndEquipment",
             "PurchaseOfPropertyPlantAndEquipment",
             "CapitalExpendituresPurchaseOfPropertyPlantAndEquipment",
-        ) or 0)
+        ) or 0
+        lease_payments = g(
+            "FinanceLeasePrincipalPayments",
+            "RepaymentsOfFinanceLeaseLiability",
+        ) or 0
+        result["capex"] = abs(raw_capex) + abs(lease_payments)
         result["delta_wc"] = abs(g(
             "IncreaseDecreaseInOperatingCapital",
             "IncreaseDecreaseInOtherOperatingLiabilities",
@@ -382,8 +433,11 @@ def fetch_from_edgar(ticker: str) -> dict:
             "CommonStockholdersEquity",
         )
         result["cash"] = g(
-            "CashAndCashEquivalentsAtCarryingValue",
+            # Priority: cash + short-term investments (marketable securities)
+            # Damodaran Ch 16: treat marketable securities as part of cash in the equity bridge
             "CashCashEquivalentsAndShortTermInvestments",
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+            "CashAndCashEquivalentsAtCarryingValue",
             "CashAndCashEquivalents",
         )
         result["total_assets"] = g("Assets")
