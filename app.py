@@ -38,24 +38,48 @@ st.markdown('<div class="section-label">Company</div>', unsafe_allow_html=True)
 
 with st.container():
     st.markdown('<div class="ticker-box">', unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col1:
+
+    row1col1, row1col2, row1col3 = st.columns([1, 2, 1])
+    with row1col1:
         ticker_input = st.text_input(
             "Ticker",
             value=st.session_state.get("ticker", "AAPL"),
-            placeholder="e.g. AAPL, MSFT, TSLA, JPM",
+            placeholder="e.g. AAPL, MSFT, TSLA",
             key="ticker_input_home",
         )
-    with col2:
+    with row1col2:
         fred_key_input = st.text_input(
-            "FRED API key",
+            "FRED API key (for risk-free rate)",
             value=st.session_state.get("fred_key", ""),
             type="password",
-            placeholder="Paste your FRED API key here",
-            help="Free at fred.stlouisfed.org — used for the 10-yr Treasury yield (risk-free rate)",
+            placeholder="Free at fred.stlouisfed.org",
             key="fred_key_input_home",
         )
-    with col3:
+    with row1col3:
+        from data_fetcher import INDUSTRY_NAMES_BETA
+        industry_input = st.selectbox(
+            "Industry (for beta fallback)",
+            ["(Auto-detect)"] + INDUSTRY_NAMES_BETA,
+            key="industry_input_home",
+            help="Used if yfinance cannot fetch beta — pre-loaded from Damodaran Jan 2026",
+        )
+        industry_val = None if industry_input == "(Auto-detect)" else industry_input
+
+    st.markdown("""<div style='font-size:0.78rem;color:#64748b;margin:8px 0 4px'>
+    If yfinance is rate-limited, enter market data manually:
+    </div>""", unsafe_allow_html=True)
+
+    row2col1, row2col2, row2col3, row2col4 = st.columns(4)
+    with row2col1:
+        manual_price  = st.number_input("Stock price ($)",     value=0.0, min_value=0.0,
+                                         key="manual_price",   help="0 = fetch from yfinance")
+    with row2col2:
+        manual_mktcap = st.number_input("Market cap ($m)",     value=0.0, min_value=0.0,
+                                         key="manual_mktcap",  help="0 = price × shares")
+    with row2col3:
+        manual_beta   = st.number_input("Beta",                value=0.0, min_value=0.0,
+                                         key="manual_beta",    help="0 = industry average from Damodaran")
+    with row2col4:
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
         fetch_clicked = st.button(
             "🔄 Load company data",
@@ -63,15 +87,24 @@ with st.container():
             use_container_width=True,
             key="home_fetch",
         )
+
     st.markdown('</div>', unsafe_allow_html=True)
 
 # Fetch on button click
 if fetch_clicked and ticker_input.strip():
     ticker_clean = ticker_input.upper().strip()
-    with st.spinner(f"Fetching {ticker_clean} from yfinance, EDGAR, FRED…"):
+    with st.spinner(f"Fetching {ticker_clean} from EDGAR + FRED + yfinance…"):
         try:
             from data_fetcher import get_company_data
-            d = get_company_data(ticker_clean, fred_api_key=fred_key_input, force_refresh=True)
+            d = get_company_data(
+                ticker_clean,
+                fred_api_key=fred_key_input,
+                force_refresh=True,
+                manual_price=manual_price,
+                manual_mktcap=manual_mktcap,
+                manual_beta=manual_beta,
+                industry=industry_val,
+            )
             d.ebitda = d.ebitda or (d.ebit + d.depreciation)
             d.fcff   = d.ebit * (1 - d.tax_rate) - (d.capex - d.depreciation) - d.delta_wc
             st.session_state["company_data"] = d
