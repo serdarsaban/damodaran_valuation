@@ -318,42 +318,48 @@ def _get_xbrl_fact(facts: dict, *concept_names: str, form: str = "10-K",
                     continue
 
             # ── Path B: end-date-gap filter (no start date, e.g. META Revenues) ─
-            # Some filers store quarterly facts with only an end date (no start).
-            # Identify single quarters by checking consecutive end-date gaps ~90 days.
-            # CRITICAL: exclude fp=FY annual records — they share the same end date
-            # as the last quarter and would appear as the "first" entry, causing
-            # the chain to stall because the next gap would be ~90 days into a
-            # different year rather than ~90 days backward within the same year.
+            # Some filers (META for Revenues) store quarterly facts with only an
+            # end date and no start date. We identify genuine single quarters by
+            # checking that consecutive end-dates are 75–105 days apart.
+            # CRITICAL: only include form=10-Q records and exclude fp=FY so that
+            # annual 10-K records (which share a year-end date with Q4) don't
+            # anchor the chain at the wrong point.
             if len(q_candidates) < 4:
                 end_only = [(x.get("end",""), float(x["val"]))
                             for x in units
                             if x.get("val") is not None
                             and x.get("end","")
                             and not x.get("start","")
-                            and x.get("form") == "10-Q"   # 10-Q only — exclude 10-K/FY
-                            and x.get("fp") != "FY"]      # exclude annual fp; allow None/Q1/Q2/Q3/Q4
+                            and x.get("form") == "10-Q"
+                            and x.get("fp") != "FY"]
                 if len(end_only) >= 4:
-                    # Sort descending, deduplicate by end date
+                    # Deduplicate by end date (keep latest-filed value per date)
                     seen_b: dict[str, float] = {}
                     for e, v in sorted(end_only, key=lambda x: x[0], reverse=True):
                         if e not in seen_b:
                             seen_b[e] = v
                     ends_b = sorted(seen_b.keys(), reverse=True)
-                    # Check consecutive gaps are 75-105 days (one quarter)
-                    valid_chain = []
-                    for i, e in enumerate(ends_b):
-                        if i == 0:
+
+                    # Walk from most-recent end date, greedily accept any record
+                    # whose gap from the previous accepted record is 75–105 days.
+                    # Do NOT break on a bad gap — skip it and keep looking.
+                    # Stop once we have 4 accepted records.
+                    valid_chain: list[str] = []
+                    for e in ends_b:
+                        if not valid_chain:
                             valid_chain.append(e)
-                        elif valid_chain:
+                        else:
                             try:
                                 gap = (_dt.strptime(valid_chain[-1], "%Y-%m-%d") -
                                        _dt.strptime(e, "%Y-%m-%d")).days
                                 if 75 <= gap <= 105:
                                     valid_chain.append(e)
-                                else:
-                                    break  # gap too large — likely annual or gap in series
+                                    if len(valid_chain) == 4:
+                                        break  # have enough
+                                # else: gap wrong size — skip this record, try next
                             except ValueError:
-                                break
+                                continue
+
                     if len(valid_chain) >= 4:
                         q_candidates = [(e, seen_b[e]) for e in valid_chain[:4]]
 
@@ -549,14 +555,28 @@ def fetch_from_edgar(ticker: str) -> dict:
         g = lambda *names: _get_xbrl_fact(facts, *names)
 
         def gs(label, *names):
-            """Fetch with source tracking; appends TTM note if applicable."""
+            """Fetch with source tracking; appends a note when TTM is used."""
             val, src = _get_xbrl_fact_sourced(facts, *names)
             if val is not None and "TTM" in src:
-                result["data_notes"].append(
-                    f"{label}: {src} — EDGAR 10-K/FY not yet indexed for most recent fiscal year. "
-                    f"Value is trailing twelve months ending {src.split('to ')[-1]}. "
-                    f"Consider overriding with the 10-K annual figure if available."
-                )
+                ttm_end_date = src.split("to ")[-1].strip()
+                # Only warn if TTM end date is more than 18 months old
+                try:
+                    from datetime import datetime as _dt2
+                    months_old = (_dt2.now() - _dt2.strptime(ttm_end_date, "%Y-%m-%d")).days / 30
+                    if months_old > 18:
+                        result["data_notes"].append(
+                            f"{label}: TTM ends {ttm_end_date} ({months_old:.0f} months ago) — "
+                            f"EDGAR quarterly data appears stale. "
+                            f"Consider overriding with the annual 10-K figure."
+                        )
+                    else:
+                        # Recent TTM is normal — just log it quietly
+                        result["data_notes"].append(
+                            f"{label}: using TTM (4Q to {ttm_end_date}) — "
+                            f"more recent than last 10-K/FY annual filing."
+                        )
+                except ValueError:
+                    pass
             return val
 
         # Company name
